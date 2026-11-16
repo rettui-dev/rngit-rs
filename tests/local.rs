@@ -104,6 +104,27 @@ fn a_file_is_text_cut_at_the_limit_or_binary() {
     assert!(matches!(local::file(&copy, "refs/heads/main", "nope.txt", 10), Err(Error::Git(_))));
 }
 
+#[test]
+fn a_file_too_big_to_read_whole_is_not_read_for_a_short_look() {
+    let tmp = tempfile::tempdir().unwrap();
+    let work = tmp.path().join("work");
+    work_repo(&work, 1);
+    let size = local::MAX_FILE_READ + 1;
+    std::fs::write(work.join("big.txt"), "a".repeat(size as usize)).unwrap();
+    git(&work, &["add", "."]);
+    git(&work, &["commit", "-q", "-m", "big"]);
+    let short = local::file(&work, "refs/heads/main", "big.txt", 64 * 1024);
+    assert!(matches!(short, Err(Error::TooLarge { what: "file", .. })), "{short:?}");
+    // Asked for all of it, it is read.
+    let whole = local::file(&work, "refs/heads/main", "big.txt", size as usize).unwrap();
+    assert_eq!((whole.size, whole.truncated, whole.text.map(|t| t.len())), (size, false, Some(size as usize)));
+    // At the limit, a short look still works.
+    std::fs::write(work.join("big.txt"), "a".repeat(local::MAX_FILE_READ as usize)).unwrap();
+    git(&work, &["commit", "-q", "-a", "-m", "smaller"]);
+    let short = local::file(&work, "refs/heads/main", "big.txt", 10).unwrap();
+    assert_eq!((short.truncated, short.text.as_deref()), (true, Some("aaaaaaaaaa")));
+}
+
 #[tokio::test]
 async fn a_mirrored_repository_can_be_read_offline() {
     let tmp = tempfile::tempdir().unwrap();

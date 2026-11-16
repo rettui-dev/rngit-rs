@@ -194,11 +194,7 @@ impl Default for Quotas {
             max_release_bytes: 256 * 1024 * 1024,
             max_repo_bytes: 1024 * 1024 * 1024,
             max_repos_per_group: 1000,
-            pack: bundle::PackLimits {
-                max_objects: 2_000_000,
-                max_object_bytes: 128 * 1024 * 1024,
-                max_total_bytes: 2 * 1024 * 1024 * 1024,
-            },
+            pack: bundle::PackLimits::default(),
         }
     }
 }

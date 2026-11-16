@@ -70,16 +70,13 @@ fn public_v6(ip: Ipv6Addr) -> bool {
 /// Fetch every branch and tag of `source` into the bare repository at `dest`
 /// and point HEAD where the source's does. Gives the names of the refs the
 /// source has. Gives up after `timeout`, or once `dest` is bigger than `max_bytes`.
-pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64) -> Result<Vec<String>, String> {
+/// No object bigger than `max_object` is unpacked.
+pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64, max_object: u64) -> Result<Vec<String>, String> {
     use gix::protocol::handshake::Ref;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     let mut repo = gix::open(dest).map_err(|e| e.to_string())?;
-    {
-        let mut config = repo.config_snapshot_mut();
-        config.set_raw_value_by("http", None, "followRedirects", "false").map_err(|e| e.to_string())?;
-        config.set_raw_value_by("gitoxide", Some("http".into()), "connectTimeout", "30000").map_err(|e| e.to_string())?;
-    }
+    limit(&mut repo, max_object)?;
     let remote = repo
         .remote_at(source)
         .and_then(|r| r.with_refspecs(["+refs/heads/*:refs/heads/*", "+refs/tags/*:refs/tags/*", "HEAD"], gix::remote::Direction::Fetch))
@@ -132,6 +129,18 @@ pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64)
             .map_err(|_| "Could not set HEAD".to_string())?;
     }
     Ok(kept.into_iter().collect())
+}
+
+/// Set up `repo` for a fetch from a source a sender picked: no redirects, a
+/// connect timeout, and gix refuses to unpack an object over `max_object`
+/// (the pack streams straight into gix, so it can't be checked first, and a
+/// pack of a few hundred bytes can declare gigabytes).
+fn limit(repo: &mut gix::Repository, max_object: u64) -> Result<(), String> {
+    let mut config = repo.config_snapshot_mut();
+    config.set_raw_value_by("http", None, "followRedirects", "false").map_err(|e| e.to_string())?;
+    config.set_raw_value_by("gitoxide", Some("http".into()), "connectTimeout", "30000").map_err(|e| e.to_string())?;
+    config.set_raw_value_by("gitoxide", Some("objects".into()), "allocLimit", max_object.to_string()).map_err(|e| e.to_string())?;
+    config.commit().map(drop).map_err(|e| e.to_string())
 }
 
 /// gix's HTTP options for `source`, trusting the root certificates rngit comes
@@ -200,6 +209,16 @@ mod tests {
         }
         let e = Handshake(std::io::Error::other("No CA certificates were loaded from the system"));
         assert_eq!(why(&e), "Transport handshake failed: No CA certificates were loaded from the system");
+    }
+
+    #[test]
+    fn a_fetch_unpacks_no_object_over_the_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut repo = gix::init_bare(dir.path()).unwrap();
+        limit(&mut repo, 1234).unwrap();
+        let config = repo.config_snapshot();
+        assert_eq!(config.integer("gitoxide.objects.allocLimit"), Some(1234));
+        assert_eq!(config.boolean("http.followRedirects"), Some(false));
     }
 
     #[test]

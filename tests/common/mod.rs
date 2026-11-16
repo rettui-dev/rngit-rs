@@ -216,3 +216,67 @@ impl Transport for MockNode {
         })
     }
 }
+
+/// A bundle of a few hundred bytes whose pack makes one object of `size`
+/// bytes: a 64 KiB blob of zeros, and a delta copying it `size / 64 KiB`
+/// times. Its one ref names the small blob.
+pub fn pack_bomb(size: u64) -> (Vec<u8>, gix::ObjectId) {
+    use std::io::Write;
+    let hasher = || gix::hash::hasher(gix::hash::Kind::Sha1);
+    let zlib = |data: &[u8]| {
+        let mut out = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        out.write_all(data).unwrap();
+        out.finish().unwrap()
+    };
+    let varint = |mut v: u64, out: &mut Vec<u8>| loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            break out.push(byte);
+        }
+        out.push(byte | 0x80);
+    };
+    // An entry's type (3 blob, 7 delta by id) and the size it declares.
+    let header = |kind: u8, size: u64, out: &mut Vec<u8>| {
+        let (mut byte, mut rest) = ((kind << 4) | (size & 0x0f) as u8, size >> 4);
+        while rest != 0 {
+            out.push(byte | 0x80);
+            (byte, rest) = ((rest & 0x7f) as u8, rest >> 7);
+        }
+        out.push(byte);
+    };
+    let base = vec![0u8; 65536];
+    let mut id = hasher();
+    id.update(b"blob 65536\0");
+    id.update(&base);
+    let base_id = id.try_finalize().unwrap();
+    let mut delta = Vec::new();
+    varint(65536, &mut delta);
+    varint(size, &mut delta);
+    // Each 0x80 copies 64 KiB from the start of the base.
+    delta.resize(delta.len() + (size / 65536) as usize, 0x80);
+    let mut pack = b"PACK\0\0\0\x02\0\0\0\x02".to_vec();
+    header(3, 65536, &mut pack);
+    pack.extend(zlib(&base));
+    header(7, delta.len() as u64, &mut pack);
+    pack.extend_from_slice(base_id.as_bytes());
+    pack.extend(zlib(&delta));
+    let mut sum = hasher();
+    sum.update(&pack);
+    pack.extend_from_slice(sum.try_finalize().unwrap().as_bytes());
+    let mut bundle = format!("# v2 git bundle\n{base_id} refs/heads/main\n\n").into_bytes();
+    bundle.extend(pack);
+    (bundle, base_id)
+}
+
+/// A node that lists one branch and answers every fetch with `bundle`.
+pub struct Bomb(pub Vec<u8>, pub gix::ObjectId);
+
+impl Transport for Bomb {
+    async fn request(&self, path: &str, _data: Vec<u8>) -> Result<Response, Error> {
+        Ok(match path {
+            "/git/list" => ok(format!("{} refs/heads/main\n@refs/heads/main HEAD\n", self.1).as_bytes()),
+            _ => Response::File { data: self.0.clone(), metadata: None },
+        })
+    }
+}

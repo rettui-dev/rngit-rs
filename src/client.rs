@@ -25,6 +25,9 @@ pub struct Limits {
     pub max_refs: usize,
     /// Most entries read from any list in a reply.
     pub max_list_entries: usize,
+    /// What a fetched bundle's pack may unpack to. A pack of a few hundred
+    /// bytes can declare gigabytes, and unpacking holds each object whole.
+    pub pack: bundle::PackLimits,
 }
 
 impl Default for Limits {
@@ -35,6 +38,7 @@ impl Default for Limits {
             max_reply_bytes: 16 * 1024 * 1024,
             max_refs: 100_000,
             max_list_entries: 10_000,
+            pack: bundle::PackLimits::default(),
         }
     }
 }
@@ -296,7 +300,7 @@ impl<T: Transport> Client<T> {
     pub async fn fetch_into(&self, repo: &RepoUrl, wants: &[Want], dest: &Path) -> Result<Vec<(ObjectId, String)>> {
         let data = self.fetch_bundle_with(repo, wants, &Self::haves_in(wants, dest)).await?;
         let repository = bundle::open_or_init_bare(dest)?;
-        bundle::ingest(&repository, &data)
+        bundle::ingest_checked(&repository, &data, self.limits.pack)
     }
 
     /// Like [`Client::fetch_into`] but only adds objects: no ref is written.
@@ -304,7 +308,7 @@ impl<T: Transport> Client<T> {
     pub async fn fetch_objects(&self, repo: &RepoUrl, wants: &[Want], dest: &Path) -> Result<Vec<(ObjectId, String)>> {
         let data = self.fetch_bundle_with(repo, wants, &Self::haves_in(wants, dest)).await?;
         let repository = gix::open(dest).map_err(Error::git)?;
-        bundle::ingest_objects(&repository, &data)
+        bundle::ingest_objects_checked(&repository, &data, self.limits.pack, &std::sync::atomic::AtomicBool::new(false))
     }
 
     /// Fetch every branch and tag the node lists, plus HEAD, into `dest`.

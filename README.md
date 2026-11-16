@@ -87,7 +87,8 @@ identity git uses. The command logic is `rngit::cli`, so it is tested without a 
 
 Everything a node sends is untrusted. Replies, bundles, artifacts and lists are size-capped
 (`Limits`), parsing never panics, ref names from bundles must be valid names under `refs/`, a
-bundle must carry the objects it builds on, artifact names with path separators are refused, and
+bundle's pack is refused before it is unpacked if it holds too many objects or would unpack too
+big (`Limits::pack`, read from the sizes the pack declares), a bundle must carry the objects it builds on, artifact names with path separators are refused, and
 a pushed ref is checked for fast-forward locally because the node's refusal can't be told apart
 from a corrupt bundle. Release files are verified offline: signature, signer-equals-hash-of-key,
 artifact hash and the manifest's notes hash. **Trusting the signer is the caller's decision.**

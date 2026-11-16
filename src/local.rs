@@ -28,6 +28,10 @@ pub const MAX_SKIP: usize = 20_000;
 /// Most changes listed for one commit, and most tree entries compared to find them.
 pub const MAX_CHANGES: usize = 1000;
 const MAX_COMPARED: usize = 100_000;
+/// Largest file `file` reads to show the start of. gix reads an object whole
+/// (a delta needs its base whole too), so a short look at a bigger file would
+/// still cost all of it; one this big costs little more than a page of text.
+pub const MAX_FILE_READ: u64 = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitInfo {
@@ -307,6 +311,7 @@ pub fn tree(dir: &Path, refname: &str, path: &str) -> Result<Vec<TreeEntry>> {
 }
 
 /// A file of a branch, tag or commit: its size, and its text up to `max_bytes` if it is text.
+/// A file over [`MAX_FILE_READ`] (or `max_bytes`, if more) isn't read.
 pub fn file(dir: &Path, refname: &str, path: &str, max_bytes: usize) -> Result<FileView> {
     let repo = gix::open(dir).map_err(Error::git)?;
     let entry = lookup(&repo, refname, path)?.ok_or_else(|| Error::InvalidInput("that is the top folder, not a file".into()))?;
@@ -314,6 +319,10 @@ pub fn file(dir: &Path, refname: &str, path: &str, max_bytes: usize) -> Result<F
         return Err(Error::InvalidInput(format!("{path:?} is not a file")));
     }
     let size = repo.find_header(entry.object_id()).map_err(Error::git)?.size();
+    let most = MAX_FILE_READ.max(max_bytes as u64);
+    if size > most {
+        return Err(Error::TooLarge { what: "file", size: usize::try_from(size).unwrap_or(usize::MAX), limit: most as usize });
+    }
     // Read no more than asked (a little over, so a cut can be told from the end).
     let blob = entry.object().map_err(Error::git)?;
     let data = &blob.data;

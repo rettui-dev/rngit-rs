@@ -842,6 +842,47 @@ fn source_url() -> String {
     url().to_string()
 }
 
+/// A source that serves whatever bundle it is given, fetched as the node's
+/// own upstream fetches (`Client::clone_into` with `Limits::default()`).
+#[derive(Debug)]
+struct Serving(std::sync::Mutex<(Vec<u8>, gix::ObjectId)>);
+
+impl rngit::server::Upstream for Serving {
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, _timeout: std::time::Duration) -> Result<(), String> {
+        let (bundle, tip) = self.0.lock().unwrap().clone();
+        let client = Client::new(Bomb(bundle, tip)).with_limits(rngit::Limits::default());
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| {
+                    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().map_err(|e| e.to_string())?;
+                    runtime.block_on(client.clone_into(source, dest)).map(drop).map_err(|e| e.to_string())
+                })
+                .join()
+                .unwrap_or_else(|_| Err("fetching panicked".into()))
+        })
+    }
+}
+
+#[tokio::test]
+async fn a_mirror_whose_source_unpacks_too_big_is_refused() {
+    let (tmp, mut node) = open_node();
+    let small = pack_bomb(1024 * 1024);
+    let first = small.1;
+    let serving = std::sync::Arc::new(Serving(std::sync::Mutex::new(small)));
+    node.upstream = Some(serving.clone());
+    let client = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    client.mirror(&new_url(), &source_url()).await.unwrap();
+    let mirrored = tmp.path().join("repos/public/new.git");
+
+    // The source now sends a pack of a few hundred bytes that unpacks to 129 MiB.
+    *serving.0.lock().unwrap() = pack_bomb(129 * 1024 * 1024);
+    assert_eq!(node.sync_mirrors(std::time::Duration::ZERO), 0);
+    assert_eq!(rngit::bundle::resolve_ref(&gix::open(&mirrored).unwrap(), "refs/heads/main").unwrap(), first);
+    let err = client.mirror(&"rns://00112233445566778899aabbccddeeff/public/other".parse().unwrap(), &source_url()).await.unwrap_err();
+    assert!(err.to_string().contains("pack is too big"), "{err}");
+    assert!(!tmp.path().join("repos/public/other.git").exists());
+}
+
 #[tokio::test]
 async fn a_fork_and_a_mirror_follow_their_source() {
     let (source_tmp, source, _work) = node("r:all");

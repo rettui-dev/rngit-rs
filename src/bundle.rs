@@ -131,6 +131,14 @@ pub struct PackLimits {
     pub max_total_bytes: u64,
 }
 
+impl Default for PackLimits {
+    /// What a node takes in a push, and a client in a fetch. Unpacking holds
+    /// objects in memory whole, so these bound what a pack can cost to take in.
+    fn default() -> Self {
+        PackLimits { max_objects: 2_000_000, max_object_bytes: 128 * 1024 * 1024, max_total_bytes: 2 * 1024 * 1024 * 1024 }
+    }
+}
+
 /// The size a delta says its result has: the second number at the start of
 /// the delta, after the size of its base.
 fn delta_result_size(compressed: &[u8]) -> Option<u64> {
@@ -209,18 +217,35 @@ pub fn ingest_objects_checked(
     interrupt: &AtomicBool,
 ) -> Result<Vec<(ObjectId, String)>> {
     let header = parse_header(data)?;
-    check_pack(&data[header.pack_offset..], repo.object_hash(), limits)?;
+    let pack = &data[header.pack_offset..];
+    // A bundle of nothing new has no pack, which is not unpacked either.
+    if !pack.is_empty() {
+        check_pack(pack, repo.object_hash(), limits)?;
+    }
     ingest_objects_with(repo, data, header, interrupt)
 }
 
 /// Write the bundle's pack into `repo` and point its refs at the new tips.
-/// Returns the refs that were set.
+/// Returns the refs that were set. Nothing limits what the pack unpacks to:
+/// for a bundle from a node, use [`ingest_checked`].
 pub fn ingest(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(ObjectId, String)>> {
     let refs = ingest_objects(repo, data)?;
-    for (id, name) in &refs {
+    set_refs(repo, &refs)?;
+    Ok(refs)
+}
+
+/// [`ingest`], refusing a pack over `limits` first.
+pub fn ingest_checked(repo: &gix::Repository, data: &[u8], limits: PackLimits) -> Result<Vec<(ObjectId, String)>> {
+    let refs = ingest_objects_checked(repo, data, limits, &NO_INTERRUPT)?;
+    set_refs(repo, &refs)?;
+    Ok(refs)
+}
+
+fn set_refs(repo: &gix::Repository, refs: &[(ObjectId, String)]) -> Result<()> {
+    for (id, name) in refs {
         repo.reference(name.as_str(), *id, gix::refs::transaction::PreviousValue::Any, "rngit fetch").map_err(Error::git)?;
     }
-    Ok(refs)
+    Ok(())
 }
 
 /// The most local tips sent as `have` in one fetch request.

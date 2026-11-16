@@ -174,7 +174,8 @@ impl Node {
             #[cfg(feature = "https")]
             Source::Web(url) => {
                 super::web::check(url, self.open_sources)?;
-                let listed = super::web::pull(url, dir, self.max_request_time, self.quotas.max_repo_bytes)?;
+                let listed =
+                    super::web::pull(url, dir, self.max_request_time, self.quotas.max_repo_bytes, self.quotas.pack.max_object_bytes)?;
                 want_refs.then_some(listed)
             }
             #[cfg(not(feature = "https"))]

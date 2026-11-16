@@ -188,6 +188,38 @@ async fn oversize_bundle_is_refused() {
 }
 
 #[tokio::test]
+async fn a_bundle_that_unpacks_too_big_is_refused() {
+    let tmp = tempfile::tempdir().unwrap();
+    // 129 MiB once unpacked, over the default's 128 MiB for one object.
+    let (bundle, tip) = pack_bomb(129 * 1024 * 1024);
+    assert!(bundle.len() < 1000, "{}", bundle.len());
+    let client = Client::new(Bomb(bundle.clone(), tip));
+    let dest = tmp.path().join("dest.git");
+    let err = client.clone_into(&url(), &dest).await.unwrap_err();
+    assert!(err.to_string().contains("pack is too big"), "{err}");
+    assert!(gix::open(&dest).unwrap().find_reference("refs/heads/main").is_err());
+    // The remote helper's fetch (objects only) is held to the same limits.
+    let want = rngit::Want { sha: tip, name: "refs/heads/main".into() };
+    let err = client.fetch_objects(&url(), std::slice::from_ref(&want), &dest).await.unwrap_err();
+    assert!(err.to_string().contains("pack is too big"), "{err}");
+    assert!(gix::open(&dest).unwrap().find_object(tip).is_err());
+
+    // Within the limits, the same shape is taken in.
+    let (small, tip) = pack_bomb(1024 * 1024);
+    let client = Client::new(Bomb(small, tip));
+    let dest = tmp.path().join("small.git");
+    client.clone_into(&url(), &dest).await.unwrap();
+    assert_eq!(bundle::resolve_ref(&gix::open(&dest).unwrap(), "refs/heads/main").unwrap(), tip);
+
+    // And a client can set its own.
+    let (bundle, tip) = pack_bomb(1024 * 1024);
+    let limits =
+        rngit::Limits { pack: bundle::PackLimits { max_object_bytes: 1024 * 1024 - 1, ..Default::default() }, ..Default::default() };
+    let client = Client::new(Bomb(bundle, tip)).with_limits(limits);
+    assert!(client.clone_into(&url(), &tmp.path().join("own.git")).await.is_err());
+}
+
+#[tokio::test]
 async fn create_fork_mirror_sync_send_the_right_requests() {
     let tmp = tempfile::tempdir().unwrap();
     let server = tmp.path().join("server.git");
