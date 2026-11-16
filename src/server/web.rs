@@ -6,16 +6,19 @@
 //! what only the node can: addresses on its own network are refused, redirects
 //! aren't followed, a source can't carry a password (it would be kept in the
 //! repository's config) and what is fetched is cut off at the size a repository
-//! may come to and at the time a request may take.
+//! may come to and at the time a request may take. The fetch connects to the
+//! addresses that were checked, so a name that answers differently when asked
+//! again can't send it elsewhere.
 
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, ToSocketAddrs};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::Path;
 use std::time::Duration;
 
 /// Whether a source is one this node fetches: `https://` to a public address
 /// (`open` also allows `http://` and addresses on the node's own network, for
-/// labs and tests).
-pub(super) fn check(source: &str, open: bool) -> Result<(), String> {
+/// labs and tests). Gives the addresses checked, for [`pull`] to connect to
+/// (none when `open`).
+pub(super) fn check(source: &str, open: bool) -> Result<Vec<SocketAddr>, String> {
     let url = gix::Url::from_bytes(source.into()).map_err(|_| "Invalid source URL".to_string())?;
     let scheme = match url.scheme {
         gix::url::Scheme::Https => "https",
@@ -26,15 +29,26 @@ pub(super) fn check(source: &str, open: bool) -> Result<(), String> {
         return Err("Prohibited source URL: it can't carry a login".into());
     }
     let host = url.host().filter(|h| !h.is_empty()).ok_or("Invalid source URL")?;
-    if !open {
-        let port = url.port.unwrap_or(if scheme == "https" { 443 } else { 80 });
-        let found: Vec<_> =
-            (host.trim_matches(['[', ']']), port).to_socket_addrs().map_err(|_| "The source's address isn't known")?.collect();
-        if found.is_empty() || found.iter().any(|a| !public(a.ip())) {
-            return Err("Prohibited source URL: it isn't a public address".into());
-        }
+    if open {
+        return Ok(Vec::new());
     }
-    Ok(())
+    // The checked addresses are pinned to the name the HTTP client reads from
+    // the URL; a URL it reads another name from would go unpinned.
+    if http_host(source).as_deref() != Some(&host.trim_matches(['[', ']']).to_ascii_lowercase()) {
+        return Err("Invalid source URL".into());
+    }
+    let port = url.port.unwrap_or(if scheme == "https" { 443 } else { 80 });
+    let found: Vec<_> = (host.trim_matches(['[', ']']), port).to_socket_addrs().map_err(|_| "The source's address isn't known")?.collect();
+    if found.is_empty() || found.iter().any(|a| !public(a.ip())) {
+        return Err("Prohibited source URL: it isn't a public address".into());
+    }
+    Ok(found)
+}
+
+/// The host the HTTP client connects to for `source`, as it reads the URL.
+fn http_host(source: &str) -> Option<String> {
+    let url = reqwest::Url::parse(source).ok()?;
+    Some(url.host_str()?.trim_matches(['[', ']']).to_ascii_lowercase())
 }
 
 /// Whether an address is one on the open internet.
@@ -70,8 +84,16 @@ fn public_v6(ip: Ipv6Addr) -> bool {
 /// Fetch every branch and tag of `source` into the bare repository at `dest`
 /// and point HEAD where the source's does. Gives the names of the refs the
 /// source has. Gives up after `timeout`, or once `dest` is bigger than `max_bytes`.
-/// No object bigger than `max_object` is unpacked.
-pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64, max_object: u64) -> Result<Vec<String>, String> {
+/// No object bigger than `max_object` is unpacked. With `pinned` (what [`check`]
+/// gave), the source's name is taken to mean those addresses and isn't looked up again.
+pub(super) fn pull(
+    source: &str,
+    pinned: &[SocketAddr],
+    dest: &Path,
+    timeout: Duration,
+    max_bytes: u64,
+    max_object: u64,
+) -> Result<Vec<String>, String> {
     use gix::protocol::handshake::Ref;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -97,8 +119,10 @@ pub(super) fn pull(source: &str, dest: &Path, timeout: Duration, max_bytes: u64,
             }
         });
         let result = (|| {
-            let connection =
-                remote.connect(gix::remote::Direction::Fetch).map_err(|e| e.to_string())?.with_transport_options(options(&repo, source)?);
+            let connection = remote
+                .connect(gix::remote::Direction::Fetch)
+                .map_err(|e| e.to_string())?
+                .with_transport_options(options(&repo, source, pinned)?);
             let prepared = connection.prepare_fetch(gix::progress::Discard, Default::default()).map_err(|e| why(&e))?;
             let refs = prepared.ref_map().remote_refs.clone();
             prepared.receive(gix::progress::Discard, &stop).map_err(|e| why(&e))?;
@@ -145,15 +169,23 @@ fn limit(repo: &mut gix::Repository, max_object: u64) -> Result<(), String> {
 
 /// gix's HTTP options for `source`, trusting the root certificates rngit comes
 /// with as well as the system's: a small container image has no store of its
-/// own, and without one no https source could be reached.
-fn options(repo: &gix::Repository, source: &str) -> Result<Box<dyn std::any::Any>, String> {
+/// own, and without one no https source could be reached. The source's name
+/// is resolved to `pinned`, if there are any.
+fn options(repo: &gix::Repository, source: &str, pinned: &[SocketAddr]) -> Result<Box<dyn std::any::Any>, String> {
     use gix::protocol::transport::client::blocking_io::http;
     use std::sync::{Arc, Mutex};
 
     let configured = repo.transport_options(source, None).map_err(|e| e.to_string())?;
     let mut options = configured.and_then(|o| o.downcast::<http::Options>().ok()).map(|o| *o).unwrap_or_default();
+    let pin = http_host(source).filter(|_| !pinned.is_empty()).map(|host| (host, pinned.to_vec()));
     let backend = http::reqwest::Options {
-        configure_client: Some(Box::new(|builder| Ok(builder.tls_certs_merge(bundled_roots())))),
+        configure_client: Some(Box::new(move |builder| {
+            let builder = builder.tls_certs_merge(bundled_roots());
+            Ok(match &pin {
+                Some((host, addresses)) => builder.resolve_to_addrs(host, addresses),
+                None => builder,
+            })
+        })),
         configure_request: None,
     };
     options.backend = Some(Arc::new(Mutex::new(backend)));
@@ -184,7 +216,7 @@ mod tests {
         assert_eq!(bundled_roots().len(), webpki_root_certs::TLS_SERVER_ROOT_CERTS.len());
         let dir = tempfile::tempdir().unwrap();
         let repo = gix::init_bare(dir.path()).unwrap();
-        let options = options(&repo, "https://example.com/a/b.git").unwrap();
+        let options = options(&repo, "https://example.com/a/b.git", &[]).unwrap();
         let options = options.downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>().unwrap();
         let backend = options.backend.as_ref().unwrap().lock().unwrap();
         let backend = backend.downcast_ref::<gix::protocol::transport::client::blocking_io::http::reqwest::Options>().unwrap();
@@ -209,6 +241,35 @@ mod tests {
         }
         let e = Handshake(std::io::Error::other("No CA certificates were loaded from the system"));
         assert_eq!(why(&e), "Transport handshake failed: No CA certificates were loaded from the system");
+    }
+
+    #[test]
+    fn the_fetch_connects_to_the_checked_address_without_looking_the_name_up_again() {
+        // A port nothing listens on: a refused connection shows where it went.
+        let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+        let source = format!("http://Pinned.invalid:{port}/a.git");
+        let dir = tempfile::tempdir().unwrap();
+        let repo = gix::init_bare(dir.path()).unwrap();
+        let checked: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let options = options(&repo, &source, &[checked]).unwrap();
+        let options = options.downcast_ref::<gix::protocol::transport::client::blocking_io::http::Options>().unwrap();
+        let mut backend = options.backend.as_ref().unwrap().lock().unwrap();
+        let backend = backend.downcast_mut::<gix::protocol::transport::client::blocking_io::http::reqwest::Options>().unwrap();
+        let configure = backend.configure_client.as_mut().unwrap();
+        let client = configure(reqwest::blocking::Client::builder()).unwrap().build().unwrap();
+        // `.invalid` names never resolve: only the pin can reach an address.
+        let err = client.get(&source).send().unwrap_err();
+        assert!(why(&err).to_ascii_lowercase().contains("refused"), "{}", why(&err));
+    }
+
+    #[test]
+    fn a_url_the_http_client_reads_another_host_from_is_refused() {
+        assert_eq!(http_host("https://Example.COM:8443/a.git").as_deref(), Some("example.com"));
+        assert_eq!(http_host("https://[2606:4700::1111]/a.git").as_deref(), Some("2606:4700::1111"));
+        // Read as 8.8.8.8 by the HTTP client, and as a name by gix.
+        for other in ["https://0x08080808/a.git", "https://010.010.010.010/a.git", "https://134744072/a.git"] {
+            assert_eq!(check(other, false), Err("Invalid source URL".into()), "{other}");
+        }
     }
 
     #[test]
@@ -259,8 +320,9 @@ mod tests {
         ] {
             assert!(check(bad, false).is_err(), "{bad}");
         }
-        assert!(check("https://8.8.8.8/a/b.git", false).is_ok());
-        assert!(check("http://127.0.0.1:8000/a.git", true).is_ok());
+        assert_eq!(check("https://8.8.8.8/a/b.git", false), Ok(vec!["8.8.8.8:443".parse().unwrap()]));
+        assert_eq!(check("https://8.8.8.8:8443/a/b.git", false), Ok(vec!["8.8.8.8:8443".parse().unwrap()]));
+        assert_eq!(check("http://127.0.0.1:8000/a.git", true), Ok(vec![]));
         assert!(check("ssh://git@example.com/a.git", true).is_err());
     }
 }
