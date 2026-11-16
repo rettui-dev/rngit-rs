@@ -35,6 +35,14 @@ const PATHS: [&str; 11] = [
 /// file.
 pub type Activity = Arc<dyn Fn(&str, Option<[u8; 16]>, u8) + Send + Sync>;
 
+/// Room over a request body for its Resource framing.
+const MARGIN: usize = 64 * 1024;
+
+/// The largest request body `node` takes, as Reticulum advertises it.
+fn largest_request(node: &Node) -> usize {
+    node.max_request_bytes() + MARGIN
+}
+
 /// Answer rngit requests from `node` at the `git.repositories` destination
 /// of `identity`. The destination is returned so the caller can announce it
 /// and close it; it serves until then.
@@ -45,7 +53,14 @@ pub async fn serve(
     app_data: Option<Vec<u8>>,
     activity: Option<Activity>,
 ) -> Result<RegisteredDestination, Error> {
-    let options = DestinationRuntimeOptions { default_app_data: app_data, ..DestinationRuntimeOptions::default() };
+    // A request body bigger than the node takes is refused when it's offered,
+    // before any of it comes, instead of being received and then refused.
+    let largest = largest_request(&node);
+    let options = DestinationRuntimeOptions {
+        default_app_data: app_data,
+        resource_accept: Some(ResourceAcceptPolicy::new(move |_, advertisement| advertisement.data_size <= largest)),
+        ..DestinationRuntimeOptions::default()
+    };
     let registered = runtime
         .register_destination(identity, ASPECT, options)
         .await
@@ -152,4 +167,19 @@ pub fn keep_mirrors(node: Arc<Node>, check_every: std::time::Duration, older_tha
             let _ = tokio::task::spawn_blocking(move || node.sync_mirrors(older_than)).await;
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A push of the largest bundle the node takes is still accepted when
+    /// offered, and not much more.
+    #[test]
+    fn largest_request_fits_what_the_node_takes() {
+        let node = Node::new(std::env::temp_dir());
+        let largest = largest_request(&node);
+        assert!(largest > node.quotas.max_push_bytes);
+        assert!(largest < node.quotas.max_push_bytes + 2 * 1024 * 1024);
+    }
 }

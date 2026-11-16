@@ -252,6 +252,12 @@ impl Node {
         self.cache.lock().map_or(0, |cache| cache.entries.len())
     }
 
+    /// Largest request body this node takes: a push with its bundle, or a
+    /// release file.
+    pub fn max_request_bytes(&self) -> usize {
+        MAX_REQUEST_BYTES + self.quotas.max_push_bytes.max(self.quotas.max_artifact_bytes)
+    }
+
     pub fn new(root: PathBuf) -> Self {
         Node { root, max_bundle_bytes: 256 * 1024 * 1024, max_request_time: Duration::from_secs(120), ..Node::default() }
     }
