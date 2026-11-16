@@ -93,8 +93,10 @@ pub async fn serve(
                     );
                 }
                 match response {
-                    Response::Packet(reply) => RequestOutcome::Reply(reply),
-                    Response::File { data, metadata } => RequestOutcome::ReplyFile { data, metadata, auto_compress: false },
+                    Response::Packet(reply) => RequestOutcome::ReplyBytes(reply),
+                    Response::File { data, metadata } => {
+                        RequestOutcome::ReplyFile { source: Box::new(std::io::Cursor::new(data)), metadata }
+                    }
                 }
             })
             .await

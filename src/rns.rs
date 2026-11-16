@@ -50,14 +50,42 @@ impl RnsTransport {
     }
 }
 
+/// The most a file reply is read back into memory: what a Resource may hold.
+const MAX_FILE_REPLY: u64 = 134_217_727;
+
 /// Sort a link response into a plain reply or a bulk file. rsReticulum hands a
 /// plain reply back already unwrapped (status byte then payload); only a
 /// Resource reply carries metadata, and that is how a file is told apart.
-pub(crate) fn classify(response: LinkSessionResponse) -> Response {
-    match response.metadata {
-        None => Response::Packet(response.data),
-        metadata => Response::File { data: response.data, metadata },
+/// rsReticulum 1.5 saves a file reply to a file of its own: it is read back
+/// and removed here.
+pub(crate) async fn classify(response: LinkSessionResponse) -> Result<Response, Error> {
+    let LinkSessionResponse { data, metadata, file, .. } = response;
+    let data = match file {
+        None => data,
+        Some(path) => tokio::task::spawn_blocking(move || {
+            let read = read_capped(&path, MAX_FILE_REPLY);
+            let _ = std::fs::remove_file(&path);
+            read
+        })
+        .await
+        .map_err(|e| Error::Transport(format!("reading the reply stopped: {e}")))?
+        .map_err(|e| Error::Transport(format!("could not read the reply: {e}")))?,
+    };
+    Ok(match metadata {
+        None => Response::Packet(data),
+        metadata => Response::File { data, metadata },
+    })
+}
+
+fn read_capped(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut data = Vec::new();
+    file.take(max + 1).read_to_end(&mut data)?;
+    if data.len() as u64 > max {
+        return Err(std::io::Error::other("the reply is larger than a Resource may be"));
     }
+    Ok(data)
 }
 
 impl Transport for RnsTransport {
@@ -69,7 +97,7 @@ impl Transport for RnsTransport {
             }
             let session = guard.as_ref().ok_or_else(|| Error::Transport("no link".into()))?;
             match session.handle.request(path, &data, Some(self.request_timeout)).await {
-                Ok(response) => return Ok(classify(response)),
+                Ok(response) => return classify(response).await,
                 // A dead link is worth one fresh try; anything else is final.
                 Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive) if attempt == 0 => {
                     *guard = None;
@@ -103,21 +131,45 @@ mod tests {
     use super::*;
 
     fn response(data: Vec<u8>, metadata: Option<Vec<u8>>) -> LinkSessionResponse {
-        LinkSessionResponse { request_id: [0; 16], data, metadata, response_time: Duration::ZERO }
+        LinkSessionResponse {
+            request_id: [0; 16],
+            data,
+            value: rmpv::Value::Nil,
+            metadata,
+            file: None,
+            response_time: Duration::ZERO,
+            response_size: None,
+            response_transfer_size: None,
+            started_at: None,
+            response_concluded_at: None,
+        }
     }
 
-    #[test]
-    fn reply_without_metadata_is_a_packet() {
-        assert_eq!(classify(response(b"\x00ok".to_vec(), None)), Response::Packet(b"\x00ok".to_vec()));
+    #[tokio::test]
+    async fn reply_without_metadata_is_a_packet() {
+        assert_eq!(classify(response(b"\x00ok".to_vec(), None)).await.unwrap(), Response::Packet(b"\x00ok".to_vec()));
     }
 
-    #[test]
-    fn resource_reply_is_a_file() {
+    #[tokio::test]
+    async fn resource_reply_is_a_file() {
         let bundle = b"# v2 git bundle\n".to_vec();
         assert_eq!(
-            classify(response(bundle.clone(), Some(vec![0x81, 0x01, 0x00]))),
+            classify(response(bundle.clone(), Some(vec![0x81, 0x01, 0x00]))).await.unwrap(),
             Response::File { data: bundle.clone(), metadata: Some(vec![0x81, 0x01, 0x00]) }
         );
+    }
+
+    #[tokio::test]
+    async fn a_reply_saved_to_a_file_is_read_back_and_the_file_removed() {
+        let path = std::env::temp_dir().join(format!("rngit-reply-{}", std::process::id()));
+        std::fs::write(&path, b"bundle bytes").unwrap();
+        let mut saved = response(Vec::new(), Some(vec![0x81, 0x01, 0x00]));
+        saved.file = Some(path.clone());
+        assert_eq!(
+            classify(saved).await.unwrap(),
+            Response::File { data: b"bundle bytes".to_vec(), metadata: Some(vec![0x81, 0x01, 0x00]) }
+        );
+        assert!(!path.exists());
     }
 
     #[test]
