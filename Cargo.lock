@@ -2543,7 +2543,7 @@ dependencies = [
 [[package]]
 name = "rns-crypto"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "aes",
  "cbc",
@@ -2562,7 +2562,7 @@ dependencies = [
 [[package]]
 name = "rns-identity"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "hex",
  "libc",
@@ -2583,7 +2583,7 @@ dependencies = [
 [[package]]
 name = "rns-interface"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "bytes",
  "hex",
@@ -2612,7 +2612,7 @@ dependencies = [
 [[package]]
 name = "rns-link"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "hex",
  "libc",
@@ -2630,7 +2630,7 @@ dependencies = [
 [[package]]
 name = "rns-protocol"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "bzip2",
  "hex",
@@ -2648,7 +2648,7 @@ dependencies = [
 [[package]]
 name = "rns-runtime"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "bytes",
  "hex",
@@ -2677,7 +2677,7 @@ dependencies = [
 [[package]]
 name = "rns-transport"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "bytes",
  "hex",
@@ -2698,7 +2698,7 @@ dependencies = [
 [[package]]
 name = "rns-wire"
 version = "1.5.0"
-source = "git+https://github.com/zevaryx/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
+source = "git+https://github.com/rettui-dev/rsReticulum?rev=fe7830e56049c2216160c9bea4f9971b5bdb5641#fe7830e56049c2216160c9bea4f9971b5bdb5641"
 dependencies = [
  "rns-crypto",
  "sha2",

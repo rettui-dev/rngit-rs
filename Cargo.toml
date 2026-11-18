@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.89"
 description = "Client library for rngit, the Git-over-Reticulum protocol"
 license-file = "LICENSE"
-repository = "https://github.com/zevaryx/rngit-rs"
+repository = "https://github.com/rettui-dev/rngit-rs"
 
 [features]
 default = ["reticulum", "https"]
@@ -36,8 +36,8 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 hex = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-rns-runtime = { git = "https://github.com/zevaryx/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
-rns-identity = { git = "https://github.com/zevaryx/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
+rns-runtime = { git = "https://github.com/rettui-dev/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
+rns-identity = { git = "https://github.com/rettui-dev/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"], optional = true }
 # For https sources: gix's HTTP client, to add the bundled root certificates.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }

@@ -84,4 +84,4 @@ unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 
 [sources.allow-org]
-github = ["zevaryx"]
+github = ["rettui-dev"]

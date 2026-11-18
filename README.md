@@ -5,7 +5,7 @@ plus two programs:
 
 - the **library** (`rngit`) has no UI and doesn't need a `git` binary: repository work is done
   in-process with [gix](https://github.com/GitoxideLabs/gitoxide), and the network side uses
-  [rsReticulum](https://github.com/zevaryx/rsReticulum);
+  [rsReticulum](https://github.com/rettui-dev/rsReticulum);
 - **`git-remote-rns`** is a git remote helper, so plain `git clone`, `fetch` and `push` work with
   `rns://` URLs;
 - **`rngit`** is a command line with a subcommand for every call the library makes. It shares its name with stock rngit's command, so install only one of them on `PATH`.
