@@ -1,0 +1,131 @@
+name: Release
+
+# Pushing a version tag (v1.2.0, or v1.3.0-rc.1 for a prerelease) builds the
+# git-remote-rns and rngit programs for Linux, macOS and Windows, and makes a
+# GitHub release with one archive per platform and a SHA256SUMS file attached.
+# The release notes are generated from the commits since the last tag. Run
+# workflow, on a tag, does the same as pushing that tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: Check the tag
+    runs-on: ubuntu-latest
+    steps:
+      - name: A version tag
+        if: ${{ !startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          echo "::error::Run this on a version tag (Use workflow from: Tags), not $GITHUB_REF_NAME"
+          exit 1
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+            echo "::error::Tag $GITHUB_REF_NAME does not match the version in Cargo.toml ($version)"
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+      # A release is built with --locked, so a stale Cargo.lock fails here
+      # first, before anything is built for every platform.
+      - name: Cargo.lock is up to date
+        run: cargo metadata --locked --format-version 1 > /dev/null
+
+  build:
+    name: ${{ matrix.target }}
+    needs: check
+    # Linux builds use the oldest runners for the widest glibc support.
+    runs-on: >-
+      ${{ matrix.target == 'aarch64-unknown-linux-gnu' && 'ubuntu-22.04-arm'
+      || contains(matrix.target, 'linux') && 'ubuntu-22.04'
+      || contains(matrix.target, 'windows') && 'windows-latest'
+      || 'macos-latest' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - x86_64-pc-windows-msvc
+          - aarch64-apple-darwin
+          - x86_64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package
+        id: package
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          name="rngit-${TAG//\//-}-$TARGET"
+          mkdir -p "dist/$name"
+          cp README.md LICENSE "dist/$name/"
+          cd dist
+          if [[ "$TARGET" == *windows* ]]; then
+            cp "../target/$TARGET/release/rngit.exe" "../target/$TARGET/release/git-remote-rns.exe" "$name/"
+            7z a -tzip "$name.zip" "$name" > /dev/null
+            echo "file=dist/$name.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "../target/$TARGET/release/rngit" "../target/$TARGET/release/git-remote-rns" "$name/"
+            tar -czf "$name.tar.gz" "$name"
+            echo "file=dist/$name.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: rngit-${{ matrix.target }}
+          path: ${{ steps.package.outputs.file }}
+          if-no-files-found: error
+
+  release:
+    name: GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: rngit-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum * > SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          prerelease=()
+          if [[ "$TAG" == *-* ]]; then prerelease=(--prerelease); fi
+          gh release create "$TAG" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --verify-tag \
+            --title "rngit $TAG" \
+            --generate-notes \
+            "${prerelease[@]}"

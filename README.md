@@ -53,6 +53,8 @@ The protocol sits behind the `Transport` trait, so it can be driven without Reti
 
 ## Use with git
 
+Release archives with both programs for Linux, macOS and Windows are attached to each [GitHub release](https://github.com/rettui-dev/rngit-rs/releases). To build them yourself:
+
 `cargo install --path .` installs `git-remote-rns` and `rngit`. Put them on `PATH`, then:
 
 ```
