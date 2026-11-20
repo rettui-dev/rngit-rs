@@ -36,8 +36,8 @@ sha2 = "0.10"
 ed25519-dalek = "2"
 hex = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
-rns-runtime = { git = "https://github.com/rettui-dev/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
-rns-identity = { git = "https://github.com/rettui-dev/rsReticulum", rev = "fe7830e56049c2216160c9bea4f9971b5bdb5641", optional = true }
+rns-runtime = { git = "https://github.com/rettui-dev/rsReticulum", rev = "c568774d80ab16677ad73b09ccc05290983a4115", optional = true }
+rns-identity = { git = "https://github.com/rettui-dev/rsReticulum", rev = "c568774d80ab16677ad73b09ccc05290983a4115", optional = true }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "time", "sync"], optional = true }
 # For https sources: gix's HTTP client, to add the bundled root certificates.
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "rustls"], optional = true }
