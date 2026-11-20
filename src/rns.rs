@@ -96,7 +96,8 @@ impl Transport for RnsTransport {
                 *guard = Some(self.connect().await?);
             }
             let session = guard.as_ref().ok_or_else(|| Error::Transport("no link".into()))?;
-            match session.handle.request(path, &data, Some(self.request_timeout)).await {
+            let options = RequestOptions { timeout: Some(self.request_timeout), ..RequestOptions::default() };
+            match session.handle.request_with_options(path, request_value(&data), options).await {
                 Ok(response) => return classify(response).await,
                 // A dead link is worth one fresh try; anything else is final.
                 Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive) if attempt == 0 => {
@@ -106,6 +107,16 @@ impl Transport for RnsTransport {
             }
         }
         Err(Error::Transport("link kept dropping".into()))
+    }
+}
+
+/// The request as the value stock rngit reads: the map itself, not a byte
+/// string holding it (Python nodes answer "Invalid request" to that).
+fn request_value(data: &[u8]) -> rmpv::Value {
+    let mut rest = data;
+    match rmpv::decode::read_value(&mut rest) {
+        Ok(value) if rest.is_empty() => value,
+        _ => rmpv::Value::Binary(data.to_vec()),
     }
 }
 
@@ -170,6 +181,15 @@ mod tests {
             Response::File { data: b"bundle bytes".to_vec(), metadata: Some(vec![0x81, 0x01, 0x00]) }
         );
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_request_goes_as_the_map_not_as_bytes_holding_it() {
+        let data = crate::wire::Request::group("public").put("for_push", false).encode();
+        let rmpv::Value::Map(map) = request_value(&data) else { panic!("not a map") };
+        assert_eq!(map.len(), 2);
+        // Bytes that aren't MessagePack stay bytes.
+        assert_eq!(request_value(&[0x92, 0x01]), rmpv::Value::Binary(vec![0x92, 0x01]));
     }
 
     #[test]
