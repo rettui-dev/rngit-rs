@@ -1379,8 +1379,10 @@ fn names_that_mean_something_else_on_windows_are_refused() {
 #[test]
 fn latest_is_no_name_for_a_release() {
     let (tmp, node, work) = node(&format!("adm:{}", hex::encode(ME)));
+    // Only one of `latest` and `Latest` can be a tag on a file system that
+    // ignores case (macOS, Windows), and the name is refused before the tag
+    // is looked up, so one tag is enough to show both are refused.
     git(&work, &["tag", "latest"]);
-    git(&work, &["tag", "Latest"]);
     git(&work, &["push", "-q", tmp.path().join("repos/public/demo.git").to_str().unwrap(), "--tags"]);
     let ask =
         |extra: &[(&str, rmpv::Value)]| text(&node.handle("/mgmt/release", &rmpv_request("public/demo.git", extra), Some(ME)).unwrap());
