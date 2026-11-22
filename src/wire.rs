@@ -50,10 +50,22 @@ pub fn split_reply(reply: &[u8]) -> Result<&[u8]> {
 /// and the characters that reorder text on screen are written out as
 /// escapes, so a node can't change what a terminal shows around them.
 pub fn printable(text: &str) -> String {
+    escaped(text, |_| false)
+}
+
+/// [`printable`] for text of several lines, such as release notes or a work
+/// document: newlines and tabs are kept, which move the cursor on but can't
+/// hide or rewrite what is already shown; every other control character and
+/// reordering character is escaped.
+pub fn printable_lines(text: &str) -> String {
+    escaped(text, |c| matches!(c, '\n' | '\t'))
+}
+
+fn escaped(text: &str, keep: impl Fn(char) -> bool) -> String {
     let reorders = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
-        if c.is_control() || reorders(c) {
+        if (c.is_control() || reorders(c)) && !keep(c) {
             out.extend(c.escape_default());
         } else {
             out.push(c);
@@ -165,6 +177,13 @@ mod tests {
         assert!(message.starts_with("bad \\u{1b}[2J"), "{message:?}");
         assert!(message.contains("\\r\\nline\\u{202e}"), "{message:?}");
         assert_eq!(printable("Not allowed: café"), "Not allowed: café");
+    }
+
+    #[test]
+    fn printable_lines_keep_their_lines_and_nothing_else() {
+        assert_eq!(printable_lines("one\n\ttwo\n"), "one\n\ttwo\n");
+        assert_eq!(printable_lines("a\r\nb\u{1b}[2J\u{202e}c\u{7}"), "a\\r\nb\\u{1b}[2J\\u{202e}c\\u{7}");
+        assert_eq!(printable("one\ntwo"), "one\\ntwo");
     }
 
     #[test]

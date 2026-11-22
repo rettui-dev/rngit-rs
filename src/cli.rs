@@ -112,6 +112,17 @@ fn identity_arg(arg: &str) -> Result<[u8; 16]> {
         .ok_or_else(|| Error::InvalidInput(format!("{arg:?} is not an identity hash (32 hex digits)")))
 }
 
+/// One line of text from a node (or from a copy of what one sent), with
+/// anything that could change what the terminal shows written out as escapes.
+fn one_line(text: &str) -> String {
+    crate::wire::printable(text)
+}
+
+/// Text of several lines from a node, kept as lines but otherwise escaped.
+fn lines(text: &str) -> String {
+    crate::wire::printable_lines(text)
+}
+
 fn say(out: &mut dyn Write, line: impl AsRef<str>) -> Result<()> {
     writeln!(out, "{}", line.as_ref()).map_err(Error::git)
 }
@@ -144,7 +155,16 @@ pub fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Res
             };
             let (commits, _) = crate::local::log_page(dir, refname, number(3, 0)?, number(2, 20)?)?;
             for commit in commits {
-                say(out, format!("{} {} {} {}", commit.id, iso8601(commit.time.max(0) as u64), commit.author, commit.subject))?;
+                say(
+                    out,
+                    format!(
+                        "{} {} {} {}",
+                        commit.id,
+                        iso8601(commit.time.max(0) as u64),
+                        one_line(&commit.author),
+                        one_line(&commit.subject)
+                    ),
+                )?;
             }
         }
         "commit" => {
@@ -153,15 +173,23 @@ pub fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Res
             for parent in &commit.parents {
                 say(out, format!("parent {parent}"))?;
             }
-            say(out, format!("author {} <{}> {}", commit.info.author, commit.email, iso8601(commit.info.time.max(0) as u64)))?;
-            say(out, format!("\n{}\n", commit.message.trim_end()))?;
+            say(
+                out,
+                format!(
+                    "author {} <{}> {}",
+                    one_line(&commit.info.author),
+                    one_line(&commit.email),
+                    iso8601(commit.info.time.max(0) as u64)
+                ),
+            )?;
+            say(out, format!("\n{}\n", lines(commit.message.trim_end())))?;
             for change in &commit.changes {
                 let mark = match change.kind {
                     crate::local::ChangeKind::Added => 'A',
                     crate::local::ChangeKind::Deleted => 'D',
                     crate::local::ChangeKind::Modified => 'M',
                 };
-                say(out, format!("{mark} {}", change.path))?;
+                say(out, format!("{mark} {}", one_line(&change.path)))?;
             }
             if commit.more_changes {
                 say(out, "and more")?;
@@ -175,7 +203,7 @@ pub fn local_command(command: &str, rest: &[String], out: &mut dyn Write) -> Res
                     crate::local::EntryKind::Submodule => "#",
                     crate::local::EntryKind::File => "",
                 };
-                say(out, format!("{}{mark}{}", entry.name, entry.size.map_or(String::new(), |size| format!("  {size}"))))?;
+                say(out, format!("{}{mark}{}", one_line(&entry.name), entry.size.map_or(String::new(), |size| format!("  {size}"))))?;
             }
         }
         _ => {
@@ -205,7 +233,12 @@ fn verify_command(manifest_path: &Path, dir: Option<&Path>, out: &mut dyn Write)
     let manifest = crate::sign::verify_manifest(&read(manifest_path)?)?;
     say(
         out,
-        format!("Valid release manifest for {} {}, signed by {}", manifest.name, manifest.version, hex::encode(manifest.signer.signer)),
+        format!(
+            "Valid release manifest for {} {}, signed by {}",
+            one_line(&manifest.name),
+            one_line(&manifest.version),
+            hex::encode(manifest.signer.signer)
+        ),
     )?;
     let dir = dir.or_else(|| manifest_path.parent()).filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
     let (mut valid, mut checked) = (0, 0);
@@ -215,16 +248,16 @@ fn verify_command(manifest_path: &Path, dir: Option<&Path>, out: &mut dyn Write)
         let name = Path::new(&artifact.name).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
         let path = dir.join(&name);
         if name.is_empty() || name != artifact.name || !path.is_file() {
-            say(out, format!("  File {} from the manifest does not exist here, cannot validate", artifact.name))?;
+            say(out, format!("  File {} from the manifest does not exist here, cannot validate", one_line(&artifact.name)))?;
             continue;
         }
         match crate::sign::verify_rsg(&read(&path)?, &artifact.rsg) {
             Ok(info) if info.signer == manifest.signer.signer => {
                 valid += 1;
-                say(out, format!("  File {name} validated against the manifest"))?;
+                say(out, format!("  File {} validated against the manifest", one_line(&name)))?;
             }
-            Ok(_) => say(out, format!("  File {name} was signed by someone else than the release"))?,
-            Err(_) => say(out, format!("  File {name} does not match the manifest"))?,
+            Ok(_) => say(out, format!("  File {} was signed by someone else than the release", one_line(&name)))?,
+            Err(_) => say(out, format!("  File {} does not match the manifest", one_line(&name)))?,
         }
     }
     if checked == 0 || valid != checked {
@@ -273,10 +306,10 @@ pub async fn run<T: Transport>(
         "refs" => {
             let refs = client.list(&repo, false).await?;
             for (sha, name) in &refs.refs {
-                say(out, format!("{sha} {name}"))?;
+                say(out, format!("{sha} {}", one_line(name)))?;
             }
             if let Some(head) = &refs.head {
-                say(out, format!("HEAD -> {head}"))?;
+                say(out, format!("HEAD -> {}", one_line(head)))?;
             }
         }
         "clone" => {
@@ -305,7 +338,7 @@ pub async fn run<T: Transport>(
                 ),
             )?;
             for name in &report.rejected {
-                say(out, format!("rejected (not a fast-forward): {name}"))?;
+                say(out, format!("rejected (not a fast-forward): {}", one_line(name)))?;
             }
         }
         "create" => client.create(&repo).await?,
@@ -316,7 +349,7 @@ pub async fn run<T: Transport>(
         "perms" | "gperms" => {
             let group = command == "gperms";
             match rest.get(1) {
-                None => say(out, if group { client.group_perms(&repo.group).await? } else { client.repo_perms(&repo).await? })?,
+                None => say(out, lines(&if group { client.group_perms(&repo.group).await? } else { client.repo_perms(&repo).await? }))?,
                 Some(content) => {
                     let content = text(content, input)?;
                     if group {
@@ -331,15 +364,21 @@ pub async fn run<T: Transport>(
             let list = client.releases(&repo).await?;
             for r in &list.releases {
                 let latest = if list.latest.as_deref() == Some(r.tag.as_str()) { " (latest)" } else { "" };
-                say(out, format!("{}{latest}  {}  {} artifacts  {}", r.tag, r.status, r.artifacts, r.preview))?;
+                say(
+                    out,
+                    format!("{}{latest}  {}  {} artifacts  {}", one_line(&r.tag), one_line(&r.status), r.artifacts, one_line(&r.preview)),
+                )?;
             }
         }
         "release" => {
             let r = client.release(&repo, arg(1, "TAG")?).await?;
-            say(out, format!("{}  {}  created {}  by {}", r.tag, r.status, iso8601(r.created), r.created_by))?;
-            say(out, r.notes)?;
+            say(
+                out,
+                format!("{}  {}  created {}  by {}", one_line(&r.tag), one_line(&r.status), iso8601(r.created), one_line(&r.created_by)),
+            )?;
+            say(out, lines(&r.notes))?;
             for a in &r.artifacts {
-                say(out, format!("  {}  {} bytes", a.name, a.size))?;
+                say(out, format!("  {}  {} bytes", one_line(&a.name), a.size))?;
             }
         }
         "release-get" => {
@@ -402,21 +441,21 @@ pub async fn run<T: Transport>(
             let list = client.work_list(&repo, scope(rest.get(1))?).await?;
             for (label, docs) in [("active", &list.active), ("completed", &list.completed), ("proposed", &list.proposed)] {
                 for d in docs {
-                    say(out, format!("{label}  #{}  {}  ({} comments)", d.id, d.title, d.comments))?;
+                    say(out, format!("{label}  #{}  {}  ({} comments)", d.id, one_line(&d.title), d.comments))?;
                 }
             }
         }
         "work-view" => {
             let doc = client.work_view(&repo, id(arg(1, "ID")?)?, scope(rest.get(2))?).await?;
             let check = if doc.verified { "signature verified" } else { "SIGNATURE NOT VERIFIED" };
-            say(out, format!("#{} {} [{}] by {}  {check}", doc.id, doc.title, doc.scope, doc.author))?;
-            say(out, doc.content)?;
+            say(out, format!("#{} {} [{}] by {}  {check}", doc.id, one_line(&doc.title), one_line(&doc.scope), one_line(&doc.author)))?;
+            say(out, lines(&doc.content))?;
             say(out, format!("{} comments", doc.comments.len()))?;
         }
         "work-new" | "work-propose" => {
             let kind = if command == "work-new" { WorkKind::Create } else { WorkKind::Propose };
             let (id, scope) = client.work_create(&repo, signer, kind, arg(1, "TITLE")?, &text(arg(2, "TEXT")?, input)?, "markdown").await?;
-            say(out, format!("created #{id} in {scope}"))?;
+            say(out, format!("created #{id} in {}", one_line(&scope)))?;
         }
         "work-comment" => {
             let comment =
@@ -431,7 +470,7 @@ pub async fn run<T: Transport>(
             let doc = id(arg(1, "ID")?)?;
             let (id, scope) =
                 if command == "work-complete" { client.work_complete(&repo, doc).await? } else { client.work_activate(&repo, doc).await? };
-            say(out, format!("#{id} is now {scope}"))?;
+            say(out, format!("#{id} is now {}", one_line(&scope)))?;
         }
         "work-delete" => client.work_delete(&repo, id(arg(1, "ID")?)?, scope(rest.get(2))?).await?,
         other => return Err(Error::InvalidInput(format!("unknown command {other:?}; try `rngit help`"))),

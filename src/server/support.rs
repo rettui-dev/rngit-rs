@@ -169,6 +169,19 @@ pub(super) fn claim(dir: &Path) -> Result<(), Refusal> {
     })
 }
 
+/// Whether `dir` holds a repository that opens. The empty folder that claims
+/// a name while a fork or mirror fetches doesn't, and nothing may be made
+/// beside it meanwhile (work documents, releases, rules) for the new
+/// repository to take over.
+pub(super) fn is_repository(dir: &Path) -> bool {
+    dir.join("HEAD").is_file() && gix::open(dir).is_ok()
+}
+
+/// Whether `dir` is a folder with nothing in it.
+pub(super) fn empty_dir(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
 /// What sits beside a repository and goes where it goes: its rules, releases and work documents.
 pub(super) fn beside(group_dir: &Path, repo: &str) -> [PathBuf; 3] {
     ["allowed", "releases", "work"].map(|what| group_dir.join(format!("{repo}.{what}")))

@@ -327,12 +327,18 @@ async fn refs_the_node_adds_to_a_fetch_bundle_are_not_written() {
         assert!(copy.find_reference(extra).is_err(), "{extra}");
     }
 
-    // A wanted ref the bundle points somewhere other than the node listed.
+    // A wanted ref the bundle has at another object than was listed (a push
+    // landed in between) is set to the bundle's, and the unwanted ones are
+    // still dropped.
     let elsewhere = tmp.path().join("elsewhere.git");
     let want = rngit::Want { sha: gix::ObjectId::from_hex("1".repeat(40).as_bytes()).unwrap(), name: "refs/heads/main".into() };
-    let err = client.fetch_into(&url(), &[want], &elsewhere).await.unwrap_err();
-    assert!(matches!(&err, Error::Protocol(m) if m.contains("not at what the node listed")), "{err}");
-    assert!(gix::open(&elsewhere).unwrap().find_reference("refs/heads/main").is_err());
+    let set = client.fetch_into(&url(), &[want], &elsewhere).await.unwrap();
+    assert_eq!(set, [(main, "refs/heads/main".to_string())]);
+    let copy = gix::open(&elsewhere).unwrap();
+    assert_eq!(bundle::resolve_ref(&copy, "refs/heads/main").unwrap(), main);
+    for extra in ["refs/stash", "refs/notes/x"] {
+        assert!(copy.find_reference(extra).is_err(), "{extra}");
+    }
 }
 
 #[test]
@@ -344,6 +350,14 @@ fn ingest_wanted_sets_only_what_was_asked_for() {
     let set = bundle::ingest_wanted(&repo, &data, limits, &[("refs/heads/main", None), ("refs/heads/absent", None)]).unwrap();
     assert_eq!(set, [(main, "refs/heads/main".to_string())]);
     assert!(repo.find_reference("refs/stash").is_err());
+    // A listed object that differs from the bundle's doesn't refuse it.
+    let other = gix::ObjectId::from_hex("2".repeat(40).as_bytes()).unwrap();
+    let set = bundle::ingest_wanted(&repo, &data, limits, &[("refs/heads/main", Some(other)), ("refs/stash", Some(other))]).unwrap();
+    assert_eq!(set.len(), 2);
+    assert_eq!(bundle::resolve_ref(&repo, "refs/heads/main").unwrap(), main);
+    // A bundle whose ref points at an object its pack lacks is still refused.
+    let missing = format!("# v2 git bundle\n{other} refs/heads/main\n\n");
+    assert!(bundle::ingest_wanted(&repo, missing.as_bytes(), limits, &[("refs/heads/main", None)]).is_err());
     assert!(bundle::ingest_wanted(&repo, &data, limits, &[]).unwrap().is_empty());
     // A HEAD line names no ref to write here.
     let head = format!("# v2 git bundle\n{main} HEAD\n\n");

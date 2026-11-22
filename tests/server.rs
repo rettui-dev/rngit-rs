@@ -205,6 +205,13 @@ fn a_bundle_built_lately_is_kept_until_a_ref_moves() {
 }
 
 #[test]
+fn a_node_builds_no_bundle_larger_than_a_client_takes() {
+    let node = Node::new(std::path::PathBuf::from("repos"));
+    assert_eq!(node.max_bundle_bytes, rngit::client::MAX_RESOURCE_BYTES);
+    assert_eq!(rngit::Limits::default().max_bundle_bytes, node.max_bundle_bytes);
+}
+
+#[test]
 fn big_requests_and_big_bundles_are_refused() {
     let (_tmp, mut node, _) = node("r:all");
     let long = rmpv_request("public/demo.git", &[("pad", rmpv::Value::from("x".repeat(2 * 1024 * 1024)))]);
@@ -653,7 +660,7 @@ async fn work_documents_are_written_read_commented_moved_and_deleted() {
     assert_eq!(viewed.comments.len(), 1);
     assert_eq!(a.work_list(&url(), WorkScope::All).await.unwrap().active[0].comments, 1);
 
-    // Ben edits his proposal (its author or an administrator may: see the edit tests), and Amy takes it up.
+    // Ben edits his proposal (only its author may change the text: see the edit tests), and Amy takes it up.
     b.work_edit(&url(), &ben, 2, WorkScope::Proposed, "Idea!", "Do it now").await.unwrap();
     let edited = b.work_view(&url(), 2, WorkScope::All).await.unwrap();
     assert_eq!((edited.title.as_str(), edited.content.as_str()), ("Idea!", "Do it now"));
@@ -1396,7 +1403,7 @@ fn latest_is_no_name_for_a_release() {
 }
 
 #[tokio::test]
-async fn an_edit_keeps_the_signature_of_text_it_leaves_alone_and_administrators_may_edit() {
+async fn an_edit_keeps_the_signature_of_text_it_leaves_alone_and_administrators_may_only_retitle() {
     use rngit::client::{WorkKind, WorkScope};
     use rngit::sign::Signer;
     let (amy, ben, cat) = (Key::new(1), Key::new(2), Key::new(3));
@@ -1429,12 +1436,17 @@ async fn an_edit_keeps_the_signature_of_text_it_leaves_alone_and_administrators_
     let doc = view().await;
     assert_eq!(doc.title, "Agreed plan");
     assert!(doc.verified && doc.identity == Some(ben.public_key()), "{doc:?}");
-    // And change the text, which she then signs with her own key; the author stays Ben.
-    a.work_edit(&url(), &amy, id, WorkScope::Active, "", "Amended").await.unwrap();
+    // But not change the text: the document would still name Ben as its author.
+    let refused = a.work_edit(&url(), &amy, id, WorkScope::Active, "Amended plan", "Amended").await.unwrap_err().to_string();
+    assert!(refused.contains("Only the author can change the text"), "{refused}");
     let doc = view().await;
-    assert_eq!(doc.content, "Amended");
-    assert_eq!((doc.identity, doc.author.as_str()), (Some(amy.public_key()), hash_of(&ben).as_str()));
-    assert!(rngit::sign::verify_signature(&amy.public_key(), b"Amended", &doc.signature.unwrap()).is_ok());
+    assert_eq!((doc.title.as_str(), doc.content.as_str()), ("Agreed plan", "  Step one\nStep two\n"));
+    assert!(doc.verified && doc.identity == Some(ben.public_key()), "{doc:?}");
+    // Sending Ben's text as it is, with a new title, is a title change.
+    a.work_edit(&url(), &amy, id, WorkScope::Active, "Final plan", "  Step one\nStep two\n").await.unwrap();
+    let doc = view().await;
+    assert_eq!(doc.title, "Final plan");
+    assert!(doc.verified && doc.identity == Some(ben.public_key()), "{doc:?}");
 
     // Cat may write documents, but this one is neither hers nor hers to administer.
     let refused = c.work_edit(&url(), &cat, id, WorkScope::Active, "Mine", "Stolen").await.unwrap_err().to_string();
@@ -1442,7 +1454,7 @@ async fn an_edit_keeps_the_signature_of_text_it_leaves_alone_and_administrators_
     // A signature that isn't over the text sent is refused, even for a title alone.
     let forged = a.work_edit(&url(), &ben, id, WorkScope::Active, "Forged", "").await.unwrap_err().to_string();
     assert!(forged.contains("Invalid signature"), "{forged}");
-    assert_eq!(view().await.title, "Agreed plan");
+    assert_eq!(view().await.title, "Final plan");
 }
 
 #[test]
@@ -1656,6 +1668,138 @@ async fn a_fork_claims_its_name_and_never_touches_rules_it_did_not_write() {
     assert!(!tmp.path().join("repos/public/other.git").exists());
     assert!(!rules.exists());
     me.fork(&other, &source_url()).await.unwrap();
+}
+
+/// Fetches as [`Local`] does, but first does `meanwhile`, as if at the same
+/// moment, and keeps what it gave.
+struct Meanwhile {
+    fetch: Local,
+    meanwhile: Box<dyn Fn() -> Vec<(u8, String)> + Send + Sync>,
+    answers: std::sync::Mutex<Vec<(u8, String)>>,
+}
+
+impl std::fmt::Debug for Meanwhile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Meanwhile")
+    }
+}
+
+impl rngit::server::Upstream for Meanwhile {
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+        *self.answers.lock().unwrap() = (self.meanwhile)();
+        self.fetch.pull(source, dest, timeout)
+    }
+}
+
+#[tokio::test]
+async fn nothing_can_be_made_beside_a_fork_while_it_fetches() {
+    use rngit::sign::Signer;
+    let (_source_tmp, source, _work) = node("r:all");
+    let (tmp, mut node) = open_node();
+    // Cat may do anything in the group: make documents, releases, and set rules.
+    let cat = Key::new(3);
+    node.default_rules = Rule::parse("c:all, r:all, w:all, i:all, rel:all, adm:all");
+    let rival = node.clone();
+    let sender = Sender { hash: cat.identity_hash(), key: Some(cat.public_key()) };
+    let signature = rmpv::Value::Binary(cat.sign(b"Mine").unwrap().to_vec());
+    let meanwhile = std::sync::Arc::new(Meanwhile {
+        fetch: Local { source: source.clone(), peer: ME },
+        meanwhile: Box::new(move || {
+            let ask = |path: &str, extra: &[(&str, rmpv::Value)]| {
+                text(&rival.handle_from(path, &rmpv_request("public/new.git", extra), Some(sender)).unwrap())
+            };
+            vec![
+                ask(
+                    "/mgmt/work",
+                    &[
+                        ("operation", "create".into()),
+                        ("title", "Mine".into()),
+                        ("content", "Mine".into()),
+                        ("signature", signature.clone()),
+                    ],
+                ),
+                ask("/mgmt/work", &[("operation", "list".into())]),
+                ask("/mgmt/release", &[("operation", "list".into())]),
+                ask("/mgmt/perms", &[("operation", "rperms".into()), ("step", "set".into()), ("content", "adm:all".into())]),
+                ask("/mgmt/perms", &[("operation", "rperms".into()), ("step", "get".into())]),
+            ]
+        }),
+        answers: std::sync::Mutex::new(Vec::new()),
+    });
+    node.upstream = Some(meanwhile.clone());
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    me.fork(&new_url(), &source_url()).await.unwrap();
+
+    // The claimed folder isn't a repository yet, so to all of these it isn't there.
+    let answers = meanwhile.answers.lock().unwrap().clone();
+    assert_eq!(answers.len(), 5);
+    for answer in answers {
+        assert_eq!(answer, (3, "Not found".into()));
+    }
+    assert!(!tmp.path().join("repos/public/new.git.work").exists());
+    assert_eq!(std::fs::read_to_string(tmp.path().join("repos/public/new.git.allowed")).unwrap(), format!("adm:{}", hex::encode(ME)));
+    git(&served(&tmp), &["fsck", "--strict"]);
+}
+
+#[tokio::test]
+async fn a_fork_that_finds_work_documents_beside_it_once_fetched_is_undone() {
+    let (_source_tmp, source, _work) = node("r:all");
+    let (tmp, mut node) = open_node();
+    node.default_rules = Rule::parse("c:all, r:all");
+    // Something other than a request (another program on the folder) makes them meanwhile.
+    let work = tmp.path().join("repos/public/new.git.work");
+    let made = work.clone();
+    node.upstream = Some(std::sync::Arc::new(Meanwhile {
+        fetch: Local { source: source.clone(), peer: ME },
+        meanwhile: Box::new(move || {
+            std::fs::create_dir_all(made.join("active/1")).unwrap();
+            Vec::new()
+        }),
+        answers: std::sync::Mutex::new(Vec::new()),
+    }));
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let refused = me.fork(&new_url(), &source_url()).await.unwrap_err().to_string();
+    assert!(refused.contains("still there"), "{refused}");
+    // No repository and no rules are left, and what was made meanwhile is as it was.
+    assert!(!served(&tmp).exists());
+    assert!(!tmp.path().join("repos/public/new.git.allowed").exists());
+    assert!(work.join("active/1").is_dir());
+    let left: Vec<_> = std::fs::read_dir(tmp.path().join("repos/public")).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(left, ["new.git.work"]);
+}
+
+#[tokio::test]
+async fn an_empty_folder_left_by_a_crashed_fork_does_not_block_its_name() {
+    let (_source_tmp, source, _work) = node("r:all");
+    let (tmp, node) = following(&source);
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    // As a fork that never finished leaves it: an empty folder, no rules.
+    std::fs::create_dir(served(&tmp)).unwrap();
+    me.fork(&new_url(), &source_url()).await.unwrap();
+    git(&served(&tmp), &["fsck", "--strict"]);
+
+    // A create clears one too, and so does the node's owner.
+    let other = tmp.path().join("repos/public/other.git");
+    std::fs::create_dir(&other).unwrap();
+    me.create(&"rns://00112233445566778899aabbccddeeff/public/other".parse().unwrap()).await.unwrap();
+    assert!(other.join("HEAD").is_file());
+    let third = tmp.path().join("repos/public/third.git");
+    std::fs::create_dir(&third).unwrap();
+    node.make_repository("public", "third.git", None).unwrap();
+    assert!(third.join("HEAD").is_file());
+
+    // An empty folder with rules beside it is left alone: the rules may be someone's.
+    let kept = tmp.path().join("repos/public/kept.git");
+    std::fs::create_dir(&kept).unwrap();
+    std::fs::write(tmp.path().join("repos/public/kept.git.allowed"), "adm:00000000000000000000000000000001").unwrap();
+    let refused = me.create(&"rns://00112233445566778899aabbccddeeff/public/kept".parse().unwrap()).await.unwrap_err().to_string();
+    assert!(refused.contains("already exists"), "{refused}");
+    assert!(kept.is_dir());
+    // And a folder with something in it is never cleared.
+    let full = tmp.path().join("repos/public/full.git");
+    std::fs::create_dir_all(full.join("objects")).unwrap();
+    assert!(me.fork(&"rns://00112233445566778899aabbccddeeff/public/full".parse().unwrap(), &source_url()).await.is_err());
+    assert!(full.join("objects").is_dir());
 }
 
 #[tokio::test]

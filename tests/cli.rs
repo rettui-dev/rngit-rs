@@ -389,3 +389,61 @@ async fn a_downloaded_release_is_verified_without_a_node() {
     let (result, _) = cli(&client, &["verify", "/no/such/file.rsm"], "").await;
     assert!(result.is_err());
 }
+
+#[tokio::test]
+async fn text_from_a_node_cannot_drive_the_terminal() {
+    // Clears the screen, rewrites the line and reverses what follows, wherever it is shown.
+    const EVIL: &str = "x\u{1b}[2J\r\u{202e}y";
+    let mut node = MockNode::new("/nonexistent".into());
+    node.extra = Box::new(|path, req| {
+        let op = field(req, "operation").and_then(|v| v.as_str()).unwrap_or("");
+        Some(match (path, op) {
+            ("/mgmt/release", "list") => ok(&pack(&map(vec![(
+                "releases",
+                Value::Array(vec![map(vec![("tag", s(EVIL)), ("status", s(EVIL)), ("preview", s(EVIL)), ("artifacts", Value::from(1))])]),
+            )]))),
+            ("/mgmt/release", "view") => ok(&pack(&map(vec![
+                ("tag", s(EVIL)),
+                ("created_by", s(EVIL)),
+                ("notes", s(&format!("one\n{EVIL}"))),
+                ("artifacts", Value::Array(vec![map(vec![("name", s(EVIL)), ("size", Value::from(5))])])),
+            ]))),
+            ("/mgmt/work", "list") => ok(&pack(&map(vec![(
+                "active",
+                Value::Array(vec![map(vec![("id", Value::from(1)), ("title", s(EVIL)), ("comments", Value::from(0))])]),
+            )]))),
+            ("/mgmt/work", "view") => ok(&pack(&map(vec![
+                ("id", Value::from(1)),
+                ("scope", s(EVIL)),
+                ("content", s(&format!("one\n{EVIL}"))),
+                ("comments", Value::Array(vec![])),
+                ("meta", map(vec![("title", s(EVIL)), ("author", s(EVIL))])),
+            ]))),
+            ("/mgmt/work", _) => ok(&pack(&map(vec![("id", Value::from(3)), ("scope", s(EVIL))]))),
+            ("/mgmt/perms", _) => ok(&pack(&map(vec![("content", s(&format!("r:all\n{EVIL}")))]))),
+            _ => return None,
+        })
+    });
+    let client = Client::new(node);
+    let runs: [&[&str]; 8] = [
+        &["releases", URL],
+        &["release", URL, "v1"],
+        &["work", URL],
+        &["work-view", URL, "1"],
+        &["work-new", URL, "Title", "text"],
+        &["work-complete", URL, "1"],
+        &["perms", URL],
+        &["gperms", URL],
+    ];
+    for args in runs {
+        let (result, text) = cli(&client, args, "").await;
+        result.unwrap();
+        assert!(!text.chars().any(|c| (c.is_control() && c != '\n') || c == '\u{202e}'), "{args:?}: {text:?}");
+        assert!(text.contains("x\\u{1b}[2J\\r\\u{202e}y"), "{args:?}: {text:?}");
+    }
+    // Notes, documents and rules keep their lines.
+    let (_, text) = cli(&client, &["work-view", URL, "1"], "").await;
+    assert!(text.contains("\none\nx\\u{1b}"), "{text:?}");
+    let (_, text) = cli(&client, &["perms", URL], "").await;
+    assert_eq!(text, "r:all\nx\\u{1b}[2J\\r\\u{202e}y\n");
+}

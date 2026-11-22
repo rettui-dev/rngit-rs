@@ -263,10 +263,11 @@ pub fn ingest_checked(repo: &gix::Repository, data: &[u8], limits: PackLimits) -
 /// [`ingest_checked`] for a bundle from a node that was asked for `wanted`
 /// refs: only those refs are set, so a node can't add `refs/stash`, notes or
 /// anything else to the repository by naming them in the bundle. Each entry
-/// is a full ref name and, when known, the object the node listed for it;
-/// a bundle that points a wanted ref anywhere else is refused before any ref
-/// is set. A wanted ref the bundle leaves out is not set. Returns the refs
-/// that were set.
+/// is a full ref name and, when known, the object the node listed for it.
+/// A wanted ref is set to the object the bundle names, which may differ
+/// from the one listed when a push landed between the list and the fetch;
+/// the bundle's objects are checked to be there first either way. A wanted
+/// ref the bundle leaves out is not set. Returns the refs that were set.
 pub fn ingest_wanted(
     repo: &gix::Repository,
     data: &[u8],
@@ -275,12 +276,6 @@ pub fn ingest_wanted(
 ) -> Result<Vec<(ObjectId, String)>> {
     let mut refs = ingest_checked_with(repo, data, limits, &NO_INTERRUPT, false)?;
     refs.retain(|(_, name)| wanted.iter().any(|(want, _)| want == name));
-    for (id, name) in &refs {
-        let listed = wanted.iter().find(|(want, _)| want == name).and_then(|(_, sha)| *sha);
-        if listed.is_some_and(|sha| sha != *id) {
-            return Err(Error::Protocol(format!("bundle points {name} at {id}, not at what the node listed")));
-        }
-    }
     set_refs(repo, &refs)?;
     Ok(refs)
 }

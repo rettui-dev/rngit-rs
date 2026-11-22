@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use rmpv::Value;
 
-use super::support::{claim, nothing_left_behind, now, refuse, write_file, write_new};
+use super::support::{beside, claim, nothing_left_behind, now, refuse, write_file, write_new};
 use super::{Node, Perm, Refusal, ack, dir_size, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -163,6 +163,16 @@ fn move_into_claim(tmp: &Path, claimed: &Path) -> bool {
     std::fs::rename(tmp, claimed).is_ok() || (std::fs::remove_dir(claimed).is_ok() && std::fs::rename(tmp, claimed).is_ok())
 }
 
+/// [`nothing_left_behind`], but for the rules, which a fork has written by
+/// the time it checks.
+fn nothing_left_behind_but_rules(group_dir: &Path, repo: &str) -> Result<(), Refusal> {
+    let [_, releases, work] = beside(group_dir, repo);
+    if releases.symlink_metadata().is_ok() || work.symlink_metadata().is_ok() {
+        return Err(refuse(Status::NotAllowed, "A repository of that name had rules, releases or work documents that are still there"));
+    }
+    Ok(())
+}
+
 /// The branches and tags a repository has.
 fn local_refs(repo: &Path) -> Vec<String> {
     let Ok(repo) = gix::open(repo) else { return Vec::new() };
@@ -229,6 +239,7 @@ impl Node {
                 refuse(Status::NotFound, "Not found")
             });
         }
+        let _name = self.hold_name(&group_dir, repo)?;
         let final_dir = group_dir.join(repo);
         if final_dir.exists() {
             return Err(if self.allowed(group, repo, peer, Perm::Read) {
@@ -241,7 +252,8 @@ impl Node {
     }
 
     /// Make `repo` in `group_dir` from a source, with `admin` as its
-    /// administrator if there is one. Shared by requests and the owner.
+    /// administrator if there is one. Shared by requests and the owner, who
+    /// hold the name ([`Node::hold_name`]) while this runs.
     pub(super) fn make_following(
         &self,
         group_dir: &Path,
@@ -279,17 +291,32 @@ impl Node {
             let _ = std::fs::remove_dir(&final_dir);
             return Err(refusal);
         }
-        if !move_into_claim(&tmp, &final_dir) {
-            let _ = std::fs::remove_dir_all(&tmp);
-            return Err(refuse(Status::ServerError, "Could not write repository"));
-        }
-        // The rules go in only once the repository is in place, and never over others'.
+        // The rules go in before the repository can be opened, so there is no
+        // moment when only the group's rules apply to it, and never over others'.
+        let rules = group_dir.join(format!("{repo}.allowed"));
         if let Some(admin) = admin
-            && write_new(&group_dir.join(format!("{repo}.allowed")), format!("adm:{}", hex::encode(admin)).as_bytes()).is_err()
+            && write_new(&rules, format!("adm:{}", hex::encode(admin)).as_bytes()).is_err()
         {
-            // The repository is this request's own, made a moment ago.
-            let _ = std::fs::remove_dir_all(&final_dir);
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = std::fs::remove_dir(&final_dir);
             return Err(refuse(Status::ServerError, "Could not initialize repository"));
+        }
+        // Nothing can be made beside an empty claim by a request (it isn't a
+        // repository yet), but what is there once it is would be taken over.
+        let left = || nothing_left_behind_but_rules(group_dir, repo);
+        let moved = left().is_ok() && move_into_claim(&tmp, &final_dir);
+        if !moved || left().is_err() {
+            if moved {
+                // The repository is this request's own, made a moment ago.
+                let _ = std::fs::remove_dir_all(&final_dir);
+            } else {
+                let _ = std::fs::remove_dir_all(&tmp);
+                let _ = std::fs::remove_dir(&final_dir);
+            }
+            if admin.is_some() {
+                let _ = std::fs::remove_file(&rules);
+            }
+            return Err(left().err().unwrap_or(refuse(Status::ServerError, "Could not write repository")));
         }
         Ok(())
     }

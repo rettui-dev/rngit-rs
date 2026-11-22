@@ -326,9 +326,9 @@ impl<T: Transport> Client<T> {
 
     /// Fetch the wanted refs into the repository at `dest` (made bare if it
     /// doesn't exist). Only what `dest` lacks is downloaded. Returns the refs
-    /// that were set: only the wanted ones, and only where the bundle has
-    /// them at the object each [`Want`] names. Any other ref the node puts in
-    /// the bundle is left out.
+    /// that were set: only the wanted ones, each at the object the bundle
+    /// has for it (which is newer than the [`Want`]'s if a push came in
+    /// between). Any other ref the node puts in the bundle is left out.
     pub async fn fetch_into(&self, repo: &RepoUrl, wants: &[Want], dest: &Path) -> Result<Vec<(ObjectId, String)>> {
         let data = self.fetch_bundle_with(repo, wants, &Self::haves_in(wants, dest)).await?;
         let repository = bundle::open_or_init_bare(dest)?;
@@ -869,7 +869,8 @@ impl<T: Transport> Client<T> {
         MapRef::new(&value)?.u64("id").ok_or_else(|| Error::Protocol("reply has no id".into()))
     }
 
-    /// Replace a document's content and title. Only its author may.
+    /// Replace a document's content and title. Only its author may change
+    /// the content; an administrator may change the title.
     pub async fn work_edit(
         &self,
         repo: &RepoUrl,

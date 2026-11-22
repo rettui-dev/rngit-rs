@@ -15,7 +15,7 @@
 
 use rmpv::Value;
 
-use super::support::{MAX_REPLY_BYTES, first_chars, now, packed, plain_file_name, refuse, text, write_file};
+use super::support::{MAX_REPLY_BYTES, first_chars, is_repository, now, packed, plain_file_name, refuse, text, write_file};
 use super::{Node, Perm, Refusal, ack, dir_size, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -112,7 +112,7 @@ impl Node {
         let operation = map.str("operation").ok_or(refuse(Status::BadRequest, "Invalid request"))?;
         let Some((group, repo)) = split_repo_path(&name) else { return Err(refuse(Status::NotFound, "Not found")) };
         let dir = self.root.join(group).join(repo);
-        if !dir.is_dir() || !self.allowed(group, repo, peer, Perm::Read) {
+        if !is_repository(&dir) || !self.allowed(group, repo, peer, Perm::Read) {
             return Err(refuse(Status::NotFound, "Not found"));
         }
         let changes = matches!(operation.as_str(), "create" | "delete" | "latest");
@@ -227,6 +227,13 @@ impl Node {
         if meta.len() > self.max_bundle_bytes as u64 {
             return Err(refuse(Status::ServerError, "Artifact is too large"));
         }
+        // The file is read whole into memory, as a bundle is built, so it
+        // takes a turn with the bundles being built.
+        let wait = super::BUILD_WAIT.min(self.max_request_time);
+        let _turn = self
+            .building
+            .take(self.max_bundle_builds.max(1), wait)
+            .ok_or(refuse(Status::ServerError, "The node is busy sending other files, try again later"))?;
         let data = std::fs::read(&file).map_err(|_| refuse(Status::ServerError, "Remote error"))?;
         let mut metadata = Vec::new();
         let named = Value::Map(vec![(text("name"), Value::Binary(artifact.into_bytes()))]);
@@ -363,4 +370,33 @@ fn release_latest(releases: &std::path::Path, map: &MapRef) -> Result<Response, 
     }
     write_file(&releases.join("latest"), tag.as_bytes()).map_err(|_| refuse(Status::ServerError, "Remote error"))?;
     Ok(ack())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn a_file_waits_for_a_turn_with_the_bundles_being_built() {
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let releases = tmp.path().join("demo.git.releases");
+        std::fs::create_dir_all(releases.join("v1/artifacts")).expect("release folder");
+        std::fs::write(releases.join("v1/artifacts/app.bin"), b"data").expect("artifact");
+        let mut node = Node::new(tmp.path().to_path_buf());
+        node.max_bundle_builds = 1;
+        node.max_request_time = Duration::from_millis(50);
+        let request = Value::Map(vec![(text("tag"), text("v1")), (text("artifact"), text("app.bin"))]);
+        let map = MapRef::new(&request).expect("a map");
+
+        // While the one turn is taken, the file isn't read and the peer is told why.
+        let taken = node.building.take(1, Duration::ZERO).expect("a free turn");
+        let Err(Refusal(status, why)) = node.release_fetch(&releases, &map) else { panic!("fetched while busy") };
+        assert_eq!((status, why.as_str()), (Status::ServerError, "The node is busy sending other files, try again later"));
+        drop(taken);
+        let Ok(Response::File { data, .. }) = node.release_fetch(&releases, &map) else { panic!("not fetched") };
+        assert_eq!(data, b"data");
+        // And the turn is given back.
+        assert!(node.building.take(1, Duration::ZERO).is_some());
+    }
 }

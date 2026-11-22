@@ -90,7 +90,8 @@ identity git uses. The command logic is `rngit::cli`, so it is tested without a 
 Everything a node sends is untrusted. Replies, bundles, artifacts and lists are size-capped
 (`Limits`; bundles and artifacts default to 128 MiB less a byte, the most one Reticulum reply can
 carry), parsing never panics, ref names from bundles must be valid names under `refs/`, a fetch
-sets only the refs that were asked for, at the objects the node listed (`bundle::ingest_wanted`),
+sets only the refs that were asked for (`bundle::ingest_wanted`), the `rngit` command line escapes control and
+reordering characters in what a node sends before printing it (`wire::printable`),
 a bundle's pack is refused before it is unpacked if it holds too many objects or would unpack too
 big (`Limits::pack`, read from the sizes the pack declares), a bundle must carry the objects it
 builds on, and a clone is made beside its folder and moved into place, so a failed one leaves

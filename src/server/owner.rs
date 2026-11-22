@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::support::{beside, check_rules, claim, nothing_left_behind, write_file, write_new};
+use super::support::{Held, beside, check_rules, claim, nothing_left_behind, write_file, write_new};
 use super::upstream::{checked_source, read_following};
 use super::{Following, Follows, MAX_RULES_BYTES, NULL_IDENT, Node, Perm, dir_size, split_repo_path};
 
@@ -125,13 +125,16 @@ impl Node {
         std::fs::create_dir_all(self.root.join(group)).map_err(|e| format!("Couldn't make the group {group}: {e}"))
     }
 
-    fn room_for(&self, group: &str, repo: &str) -> Result<PathBuf, String> {
+    /// The group's folder, made if need be, and the name held for whatever
+    /// is made there (see [`Node::hold_name`]), if nothing is there yet.
+    fn room_for(&self, group: &str, repo: &str) -> Result<(PathBuf, Held<'_>), String> {
         self.make_group(group)?;
         let group_dir = self.root.join(group);
+        let held = self.hold_name(&group_dir, repo).map_err(|_| format!("{group}/{repo} is being made"))?;
         if group_dir.join(repo).exists() {
             return Err(format!("{group}/{repo} is already there"));
         }
-        Ok(group_dir)
+        Ok((group_dir, held))
     }
 
     /// Make an empty repository, `repo` being `name.git`, and its group if
@@ -139,7 +142,7 @@ impl Node {
     /// one by a request does.
     pub fn make_repository(&self, group: &str, repo: &str, admin: Option<&[u8; 16]>) -> Result<(), String> {
         checked(group, repo)?;
-        let group_dir = self.room_for(group, repo)?;
+        let (group_dir, _name) = self.room_for(group, repo)?;
         let dir = group_dir.join(repo);
         let failed = |e: String| format!("Couldn't make {group}/{repo}: {e}");
         nothing_left_behind(&group_dir, repo).map_err(|r| r.1)?;
@@ -167,7 +170,7 @@ impl Node {
     pub fn follow_source(&self, group: &str, repo: &str, source: &str, kind: Follows, admin: Option<&[u8; 16]>) -> Result<(), String> {
         checked(group, repo)?;
         let parsed = checked_source(source.trim(), self.open_sources).map_err(|r| r.1)?;
-        let group_dir = self.room_for(group, repo)?;
+        let (group_dir, _name) = self.room_for(group, repo)?;
         self.make_following(&group_dir, repo, source.trim(), &parsed, kind, admin).map_err(|r| r.1)
     }
 
@@ -192,7 +195,7 @@ impl Node {
         if !from_dir.join(repo).is_dir() {
             return Err(format!("{group}/{repo} isn't there"));
         }
-        let to_dir = self.room_for(to_group, to_repo)?;
+        let (to_dir, _name) = self.room_for(to_group, to_repo)?;
         if beside(&to_dir, to_repo).iter().any(|p| p.exists()) {
             return Err(format!("{to_group}/{to_repo} still has rules, releases or work documents of an older repository"));
         }

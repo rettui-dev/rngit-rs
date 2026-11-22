@@ -9,7 +9,7 @@ use std::io::Read as _;
 
 use rmpv::Value;
 
-use super::support::{check_rules, packed, refuse, text, write_file};
+use super::support::{check_rules, is_repository, packed, refuse, text, write_file};
 use super::{MAX_RULES_BYTES, Node, Perm, Refusal, ack, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -44,7 +44,7 @@ impl Node {
             Some("rperms") => {
                 let name = int_key(request, 0).ok_or(refuse(Status::BadRequest, "No repository specified"))?;
                 let (group, repo) = split_repo_path(&name).ok_or(refuse(Status::NotFound, "Not found"))?;
-                if !self.root.join(group).join(repo).is_dir() || !self.allowed(group, repo, peer, Perm::Read) {
+                if !is_repository(&self.root.join(group).join(repo)) || !self.allowed(group, repo, peer, Perm::Read) {
                     return Err(refuse(Status::NotFound, "Not found"));
                 }
                 if !self.allowed(group, repo, peer, Perm::Admin) {

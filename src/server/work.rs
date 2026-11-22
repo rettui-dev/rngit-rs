@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use rmpv::Value;
 
-use super::support::{MAX_REPLY_BYTES, first_chars, now_f64, packed, refuse, text, write_file};
+use super::support::{MAX_REPLY_BYTES, first_chars, is_repository, now_f64, packed, refuse, text, write_file};
 use super::{Node, Perm, Refusal, access, ack, dir_size, int_key, read_rules, split_repo_path};
 use crate::error::Status;
 use crate::sign;
@@ -154,7 +154,7 @@ impl Node {
         let name = int_key(request, 0).ok_or(refuse(Status::BadRequest, "No repository specified"))?;
         let operation = map.str("operation").ok_or(refuse(Status::BadRequest, "Invalid request"))?;
         let (group, repo) = split_repo_path(&name).ok_or(refuse(Status::NotFound, "Not found"))?;
-        if !self.root.join(group).join(repo).is_dir() || !self.allowed(group, repo, peer, Perm::Read) {
+        if !is_repository(&self.root.join(group).join(repo)) || !self.allowed(group, repo, peer, Perm::Read) {
             return Err(refuse(Status::NotFound, "Not found"));
         }
         let work = self.root.join(group).join(format!("{repo}.work"));
@@ -501,10 +501,11 @@ fn work_view(work: &Path, map: &MapRef, doc_id: Option<u64>) -> Result<Response,
 }
 
 impl Node {
-    /// Change a document's title or text. Its author may, and so may an
-    /// administrator. The text kept is exactly the text signed: new text comes
-    /// with its signature and the editor's key, and an edit that leaves the
-    /// text as it was keeps the signature it had.
+    /// Change a document's title or text. Its author may change both; an
+    /// administrator who isn't the author may change the title only. The text
+    /// kept is exactly the text signed: new text comes with its signature and
+    /// the author's key, and an edit that leaves the text as it was keeps the
+    /// signature it had.
     fn work_edit(
         &self,
         who: &Who,
@@ -529,13 +530,20 @@ impl Node {
         let root = dir.join("root");
         let mut doc = Doc::read(&root).ok_or(refuse(Status::NotFound, "Document not found"))?;
         let admin = access::document(who.me, Perm::Admin, &self.doc_grants(who.work, id), repo, group);
-        if doc.author != who.me && !admin {
+        let author = doc.author == who.me;
+        if !author && !admin {
             return Err(refuse(Status::NotAllowed, "No access, not author"));
+        }
+        let new_text = !content.trim().is_empty() && content != doc.content;
+        // The author's hash stays on a document, and clients that don't match
+        // the key against it would show someone else's text as the author's.
+        if new_text && !author {
+            return Err(refuse(Status::NotAllowed, "Only the author can change the text"));
         }
         if !title.trim().is_empty() {
             doc.title = Some(title.trim().to_string());
         }
-        if !content.trim().is_empty() && content != doc.content {
+        if new_text {
             doc.content = content;
             doc.signature = Some(signature.to_vec());
             doc.identity = who.key.map(|k| k.to_vec());

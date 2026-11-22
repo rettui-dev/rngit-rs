@@ -271,7 +271,8 @@ impl Node {
     pub fn new(root: PathBuf) -> Self {
         Node {
             root,
-            max_bundle_bytes: 256 * 1024 * 1024,
+            // No larger than a client takes, so no bundle is built only to be refused.
+            max_bundle_bytes: crate::client::MAX_RESOURCE_BYTES,
             max_request_time: Duration::from_secs(120),
             max_bundle_builds: 2,
             ..Node::default()
@@ -485,6 +486,24 @@ impl Node {
 }
 
 impl Node {
+    /// Hold the name `repo` in `group_dir` while one request (or call of the
+    /// owner's) makes a repository there, so no other in this node takes it.
+    ///
+    /// A fork or mirror claims its name with an empty folder while it
+    /// fetches, so a node that stopped in the middle of one leaves that folder
+    /// behind. An empty folder with no rules beside it, that nothing in this
+    /// node is making, is such a leftover: it is removed here, so the name
+    /// can be used again.
+    fn hold_name(&self, group_dir: &Path, repo: &str) -> Result<support::Held<'_>, Refusal> {
+        let dir = group_dir.join(repo);
+        let held = self.writing.hold(&dir, Duration::ZERO).ok_or(Refusal::new(Status::NotAllowed, "Repository already exists"))?;
+        if support::empty_dir(&dir) && group_dir.join(format!("{repo}.allowed")).symlink_metadata().is_err() {
+            // Only an empty folder goes.
+            let _ = std::fs::remove_dir(&dir);
+        }
+        Ok(held)
+    }
+
     fn push(&self, request: &Value, map: &MapRef, peer: &[u8; 16]) -> Result<Response, Refusal> {
         let (name, repo) = self.writable(request, peer)?;
         let (group, dir) = split_repo_path(&name).ok_or(Refusal::new(Status::NotFound, "Not found"))?;
@@ -621,6 +640,7 @@ impl Node {
         if !may || *peer == NULL_IDENT {
             return Err(Refusal::new(Status::NotAllowed, "Not allowed"));
         }
+        let _name = self.hold_name(&group_dir, repo)?;
         let dir = group_dir.join(repo);
         if dir.exists() {
             return Err(Refusal::new(Status::NotAllowed, "Repository already exists"));
