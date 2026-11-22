@@ -197,8 +197,10 @@ async fn a_bundle_that_unpacks_too_big_is_refused() {
     let dest = tmp.path().join("dest.git");
     let err = client.clone_into(&url(), &dest).await.unwrap_err();
     assert!(err.to_string().contains("pack is too big"), "{err}");
-    assert!(gix::open(&dest).unwrap().find_reference("refs/heads/main").is_err());
+    // A failed clone leaves nothing behind.
+    assert!(!dest.exists());
     // The remote helper's fetch (objects only) is held to the same limits.
+    bundle::open_or_init_bare(&dest).unwrap();
     let want = rngit::Want { sha: tip, name: "refs/heads/main".into() };
     let err = client.fetch_objects(&url(), std::slice::from_ref(&want), &dest).await.unwrap_err();
     assert!(err.to_string().contains("pack is too big"), "{err}");

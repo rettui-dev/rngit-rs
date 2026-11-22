@@ -35,7 +35,8 @@ Permissions (TEXT is the new file content, or - to read standard input):
 Releases:
   releases URL                  list releases
   release URL TAG               show one release
-  release-get URL TAG NAME DIR  download one artifact, checked against the node's hash
+  release-get URL TAG NAME DIR [--signer HASH]   download one artifact and check its signature; prints who
+                                signed it, and with --signer refuses a release anyone but identity HASH signed
   release-new URL TAG NOTES FILE...   publish a signed release (the tag must be pushed)
   release-delete URL TAG
   release-latest URL TAG        make TAG the latest release
@@ -67,14 +68,48 @@ fn id(arg: &str) -> Result<u64> {
     arg.parse().map_err(|_| Error::InvalidInput(format!("{arg:?} is not a document id")))
 }
 
-/// Text from the command line, or from `input` when it is `-`.
+/// The most text read from standard input.
+const MAX_INPUT: usize = 1024 * 1024;
+
+/// Text from the command line, or from `input` when it is `-`. Input over
+/// [`MAX_INPUT`] is refused rather than cut short.
 fn text(arg: &str, input: &mut dyn Read) -> Result<String> {
     if arg != "-" {
         return Ok(arg.to_string());
     }
-    let mut text = String::new();
-    input.take(1024 * 1024).read_to_string(&mut text).map_err(Error::git)?;
-    Ok(text)
+    let mut data = Vec::new();
+    input.take(MAX_INPUT as u64 + 1).read_to_end(&mut data).map_err(Error::git)?;
+    if data.len() > MAX_INPUT {
+        return Err(Error::TooLarge { what: "standard input", size: data.len(), limit: MAX_INPUT });
+    }
+    String::from_utf8(data).map_err(|_| Error::InvalidInput("standard input is not UTF-8 text".into()))
+}
+
+/// Write `data` to `path` through a temporary file in the same folder, so a
+/// failure never leaves a half-written file under the real name.
+fn write_whole(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let temp = dir.join(format!(".{name}.part-{}", std::process::id()));
+    let written = (|| {
+        let mut file = std::fs::File::create(&temp)?;
+        file.write_all(data)?;
+        file.sync_all()?;
+        drop(file);
+        std::fs::rename(&temp, path)
+    })();
+    if written.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    written.map_err(Error::git)
+}
+
+/// A 16-byte identity hash written as 32 hex digits.
+fn identity_arg(arg: &str) -> Result<[u8; 16]> {
+    hex::decode(arg)
+        .ok()
+        .and_then(|raw| raw.try_into().ok())
+        .ok_or_else(|| Error::InvalidInput(format!("{arg:?} is not an identity hash (32 hex digits)")))
 }
 
 fn say(out: &mut dyn Write, line: impl AsRef<str>) -> Result<()> {
@@ -309,23 +344,40 @@ pub async fn run<T: Transport>(
         }
         "release-get" => {
             let (tag, name, dir) = (arg(1, "TAG")?, arg(2, "NAME")?, Path::new(arg(3, "DIR")?));
+            let signer = match rest.get(4..).unwrap_or_default() {
+                [] => None,
+                [flag, hash] if flag == "--signer" => Some(identity_arg(hash)?),
+                [other, ..] => return Err(Error::InvalidInput(format!("release-get: unknown option {other:?}"))),
+            };
+            crate::client::check_artifact_name(name)?;
             // The signed manifest can be saved too, to check the files offline later with `verify`.
-            let data = if name == "manifest.rsm" {
+            let (manifest, data) = if name == "manifest.rsm" {
                 let rsm = client.fetch_artifact(&repo, tag, name).await?;
-                crate::sign::verify_manifest(&rsm)?;
-                rsm
+                let manifest = crate::sign::verify_manifest(&rsm)?;
+                crate::client::check_manifest_for(&manifest, &repo, tag, signer.as_ref())?;
+                (manifest, rsm)
             } else {
-                let (_, files) = client.fetch_verified_release(&repo, tag).await?;
-                files
+                let (manifest, files) = match &signer {
+                    Some(signer) => client.fetch_release_signed_by(&repo, tag, signer).await?,
+                    None => client.fetch_verified_release(&repo, tag).await?,
+                };
+                let data = files
                     .into_iter()
                     .find(|(n, _)| n == name)
                     .map(|(_, data)| data)
-                    .ok_or_else(|| Error::InvalidInput(format!("release has no artifact {name:?}")))?
+                    .ok_or_else(|| Error::InvalidInput(format!("release has no artifact {name:?}")))?;
+                (manifest, data)
             };
-            crate::client::check_artifact_name(name)?;
             std::fs::create_dir_all(dir).map_err(Error::git)?;
-            std::fs::write(dir.join(name), &data).map_err(Error::git)?;
+            write_whole(&dir.join(name), &data)?;
             say(out, format!("saved {} ({} bytes), signature and hash verified", dir.join(name).display(), data.len()))?;
+            let who = hex::encode(manifest.signer.signer);
+            if signer.is_some() {
+                say(out, format!("signed by {who}, the identity asked for"))?;
+            } else {
+                // Anyone can make a key and sign with it, so the signature alone says nothing about who.
+                say(out, format!("signed by {who}; check that this is who you expect, or pass --signer {who} next time"))?;
+            }
         }
         "release-new" => {
             let (tag, notes) = (arg(1, "TAG")?, text(arg(2, "NOTES")?, input)?);

@@ -41,8 +41,25 @@ pub fn split_reply(reply: &[u8]) -> Result<&[u8]> {
     let (&byte, payload) = reply.split_first().ok_or_else(|| Error::Protocol("empty reply".into()))?;
     match Status::from_byte(byte) {
         Status::Ok => Ok(payload),
-        status => Err(Error::Remote { status, message: String::from_utf8_lossy(&payload[..payload.len().min(512)]).into_owned() }),
+        status => Err(Error::Remote { status, message: printable(&String::from_utf8_lossy(&payload[..payload.len().min(512)])) }),
     }
+}
+
+/// Text from a node made safe to print: control characters (such as the
+/// escape that starts a terminal colour or cursor sequence, or a newline)
+/// and the characters that reorder text on screen are written out as
+/// escapes, so a node can't change what a terminal shows around them.
+pub fn printable(text: &str) -> String {
+    let reorders = |c: char| matches!(c, '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}');
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c.is_control() || reorders(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 /// Decode one MessagePack value and reject trailing bytes.
@@ -137,6 +154,17 @@ mod tests {
             }
         }
         assert!(split_reply(b"").is_err());
+    }
+
+    #[test]
+    fn error_text_from_a_node_cannot_drive_the_terminal() {
+        let Err(Error::Remote { message, .. }) = split_reply(b"\xffbad \x1b[2J\x1b]0;title\x07\r\nline\xe2\x80\xae\x9b") else {
+            panic!("not an error")
+        };
+        assert!(!message.chars().any(|c| c.is_control() || c == '\u{202e}'), "{message:?}");
+        assert!(message.starts_with("bad \\u{1b}[2J"), "{message:?}");
+        assert!(message.contains("\\r\\nline\\u{202e}"), "{message:?}");
+        assert_eq!(printable("Not allowed: café"), "Not allowed: café");
     }
 
     #[test]

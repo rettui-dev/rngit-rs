@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 
 use rmpv::Value;
 
-use super::support::{now_f64, packed, refuse, text, write_file};
+use super::support::{MAX_REPLY_BYTES, first_chars, now_f64, packed, refuse, text, write_file};
 use super::{Node, Perm, Refusal, access, ack, dir_size, int_key, read_rules, split_repo_path};
 use crate::error::Status;
 use crate::sign;
@@ -38,6 +38,8 @@ const MAX_DOC_FILE: u64 = 2 * 1024 * 1024;
 const MAX_DOCUMENTS: usize = 5000;
 /// Comments one document keeps.
 const MAX_COMMENTS: usize = 1000;
+/// Most characters of a title a list shows.
+const MAX_LISTED_TITLE_CHARS: usize = 200;
 
 /// A document or a comment, as it is kept.
 struct Doc {
@@ -203,7 +205,7 @@ impl Node {
             "create" => self.work_new(&who, map, "active"),
             "propose" => self.work_new(&who, map, "proposed"),
             "comment" => self.work_comment(&who, map, doc_id),
-            "edit" => work_edit(&who, map, doc_id),
+            "edit" => self.work_edit(&who, map, doc_id, &repo_grants, &group_grants),
             "delete" => self.work_delete(&who, doc_id, &repo_grants, &group_grants),
             "complete" => self.work_move(&who, doc_id, &["active"], "completed", &repo_grants, &group_grants),
             "activate" => self.work_move(&who, doc_id, &["completed", "proposed"], "active", &repo_grants, &group_grants),
@@ -221,6 +223,7 @@ impl Node {
     ) -> Result<Response, Refusal> {
         let scope = map.str("scope").unwrap_or_else(|| "active".into());
         let mut lists = Vec::new();
+        let mut size = 0usize;
         for folder in SCOPES {
             let mut found = Vec::new();
             if scope == folder || scope == "all" {
@@ -229,14 +232,23 @@ impl Node {
                         continue;
                     }
                     let dir = work.join(folder).join(id.to_string());
-                    let Some(doc) = Doc::read(&dir.join("root")) else { continue };
+                    let Some(mut doc) = Doc::read(&dir.join("root")) else { continue };
+                    // A list shows no text, so none is kept while the rest are read,
+                    // and only the start of a long title.
+                    doc.content = String::new();
+                    doc.title = doc.title.map(|t| first_chars(&t, MAX_LISTED_TITLE_CHARS).to_string());
                     let comments = numbers(&dir, false).len() as u64;
                     found.push((doc.created, doc, id, comments));
                 }
             }
             found.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.2.cmp(&b.2)));
+            // The newest first, while they fit in one reply with the other scopes'.
             let items: Vec<Value> = found
                 .into_iter()
+                .take_while(|(_, doc, ..)| {
+                    size += 160 + doc.title.as_ref().map_or(8, String::len) + doc.format.len() + 2 * doc.author.len();
+                    size <= MAX_REPLY_BYTES
+                })
                 .map(|(_, doc, id, comments)| {
                     Value::Map(vec![
                         (text("id"), Value::from(id)),
@@ -444,22 +456,29 @@ fn work_view(work: &Path, map: &MapRef, doc_id: Option<u64>) -> Result<Response,
     let id = doc_id.ok_or(refuse(Status::BadRequest, "No document ID specified"))?;
     let (scope, dir) = find_doc(work, id).ok_or(refuse(Status::NotFound, "Not found"))?;
     let doc = Doc::read(&dir.join("root")).ok_or(refuse(Status::NotFound, "Document not found"))?;
-    let mut comments: Vec<(u64, Doc)> =
-        numbers(&dir, false).into_iter().take(MAX_COMMENTS).filter_map(|n| Some((n, Doc::read(&dir.join(n.to_string()))?))).collect();
-    comments.sort_by_key(|(n, _)| *n);
-    let comments: Vec<Value> = comments
-        .into_iter()
-        .map(|(n, c)| {
-            Value::Map(vec![
-                (text("id"), Value::from(n)),
-                (text("content"), text(&c.content)),
-                (text("created"), Value::from(c.created)),
-                (text("edited"), Value::from(c.edited)),
-                (text("author"), text(&c.author_hex())),
-                (text("format"), text(&c.format)),
-            ])
-        })
-        .collect();
+    // The document whole (its signature is over all of it), then the newest
+    // comments while the reply has room: older ones past that are left out.
+    let mut room = MAX_REPLY_BYTES.saturating_sub(1024 + doc.content.len() + doc.title.as_ref().map_or(0, String::len));
+    let mut numbered = numbers(&dir, false);
+    numbered.sort_unstable_by(|a, b| b.cmp(a));
+    let mut comments = Vec::new();
+    for n in numbered.into_iter().take(MAX_COMMENTS) {
+        let Some(c) = Doc::read(&dir.join(n.to_string())) else { continue };
+        let size = 160 + c.content.len() + c.format.len() + 2 * c.author.len();
+        if size > room {
+            break;
+        }
+        room -= size;
+        comments.push(Value::Map(vec![
+            (text("id"), Value::from(n)),
+            (text("content"), text(&c.content)),
+            (text("created"), Value::from(c.created)),
+            (text("edited"), Value::from(c.edited)),
+            (text("author"), text(&c.author_hex())),
+            (text("format"), text(&c.format)),
+        ]));
+    }
+    comments.reverse();
     let binary = |bytes: &Option<Vec<u8>>| bytes.clone().map_or(Value::Nil, Value::Binary);
     packed(&Value::Map(vec![
         (text("id"), Value::from(id)),
@@ -481,36 +500,48 @@ fn work_view(work: &Path, map: &MapRef, doc_id: Option<u64>) -> Result<Response,
     ]))
 }
 
-/// Change a document's title and text. Only its author may, and what they
-/// send is signed again.
-fn work_edit(who: &Who, map: &MapRef, doc_id: Option<u64>) -> Result<Response, Refusal> {
-    check_scope(map)?;
-    // Unlike a new document's, the text is signed as it comes.
-    let content = map.str("content").unwrap_or_default();
-    let title = map.str("title").unwrap_or_default();
-    let signature = who.check(map, content.as_bytes())?;
-    if title.chars().count() + content.chars().count() > MAX_DOC_CHARS {
-        return Err(refuse(Status::BadRequest, "Content limit exceeded"));
+impl Node {
+    /// Change a document's title or text. Its author may, and so may an
+    /// administrator. The text kept is exactly the text signed: new text comes
+    /// with its signature and the editor's key, and an edit that leaves the
+    /// text as it was keeps the signature it had.
+    fn work_edit(
+        &self,
+        who: &Who,
+        map: &MapRef,
+        doc_id: Option<u64>,
+        repo: &access::Grants,
+        group: &access::Grants,
+    ) -> Result<Response, Refusal> {
+        check_scope(map)?;
+        // Unlike a new document's, the text is signed as it comes.
+        let content = map.str("content").unwrap_or_default();
+        let title = map.str("title").unwrap_or_default();
+        let signature = who.check(map, content.as_bytes())?;
+        if title.chars().count() + content.chars().count() > MAX_DOC_CHARS {
+            return Err(refuse(Status::BadRequest, "Content limit exceeded"));
+        }
+        if content.trim().is_empty() && title.trim().is_empty() {
+            return Err(refuse(Status::BadRequest, "No changes specified"));
+        }
+        let id = doc_id.filter(|id| *id != 0).ok_or(refuse(Status::BadRequest, "No document ID specified"))?;
+        let (_, dir) = find_doc(who.work, id).ok_or(refuse(Status::NotFound, "Not found"))?;
+        let root = dir.join("root");
+        let mut doc = Doc::read(&root).ok_or(refuse(Status::NotFound, "Document not found"))?;
+        let admin = access::document(who.me, Perm::Admin, &self.doc_grants(who.work, id), repo, group);
+        if doc.author != who.me && !admin {
+            return Err(refuse(Status::NotAllowed, "No access, not author"));
+        }
+        if !title.trim().is_empty() {
+            doc.title = Some(title.trim().to_string());
+        }
+        if !content.trim().is_empty() && content != doc.content {
+            doc.content = content;
+            doc.signature = Some(signature.to_vec());
+            doc.identity = who.key.map(|k| k.to_vec());
+        }
+        doc.edited = now_f64();
+        write_file(&root, &doc.encode()).map_err(|_| refuse(Status::ServerError, "Error saving document"))?;
+        Ok(ack())
     }
-    if content.is_empty() && title.is_empty() {
-        return Err(refuse(Status::BadRequest, "No changes specified"));
-    }
-    let id = doc_id.filter(|id| *id != 0).ok_or(refuse(Status::BadRequest, "No document ID specified"))?;
-    let (_, dir) = find_doc(who.work, id).ok_or(refuse(Status::NotFound, "Not found"))?;
-    let root = dir.join("root");
-    let mut doc = Doc::read(&root).ok_or(refuse(Status::NotFound, "Document not found"))?;
-    if doc.author != who.me {
-        return Err(refuse(Status::NotAllowed, "No access, not author"));
-    }
-    if !title.trim().is_empty() {
-        doc.title = Some(title.trim().to_string());
-    }
-    if !content.trim().is_empty() {
-        doc.content = content.trim().to_string();
-    }
-    doc.edited = now_f64();
-    doc.signature = Some(signature.to_vec());
-    doc.identity = who.key.map(|k| k.to_vec());
-    write_file(&root, &doc.encode()).map_err(|_| refuse(Status::ServerError, "Error saving document"))?;
-    Ok(ack())
 }

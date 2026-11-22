@@ -173,7 +173,7 @@ async fn fetch_verified_release_checks_signatures() {
             name: "demo.git",
             version: "v1",
             released: "r",
-            origin: [0; 16],
+            origin: url().destination,
             path: "public/demo.git",
             commit: "c",
             message: b"n",
@@ -205,6 +205,7 @@ async fn work_documents_round_trip_with_signature_check() {
     let key = Key::new(6);
     let store = std::sync::Mutex::new(None::<(String, Vec<u8>)>);
     let public = key.public_key();
+    let author = key.identity_hash();
     let client = Client::new(node(move |_, req| {
         Some(match field(req, "operation")?.as_str()? {
             "create" | "propose" => {
@@ -225,7 +226,7 @@ async fn work_documents_round_trip_with_signature_check() {
                             ("title", s("Doc")),
                             ("created", Value::F64(1.5)),
                             ("edited", Value::F64(2.5)),
-                            ("author", Value::Binary(vec![0xab; 16])),
+                            ("author", Value::Binary(author.to_vec())),
                             ("identity", Value::Binary(public.to_vec())),
                             ("signature", Value::Binary(sig)),
                             ("format", s("markdown")),
@@ -259,7 +260,7 @@ async fn work_documents_round_trip_with_signature_check() {
     let doc = client.work_view(&url(), id, WorkScope::Active).await.unwrap();
     assert!(doc.verified);
     assert_eq!(doc.content, "Body text");
-    assert_eq!(doc.author, "ab".repeat(16));
+    assert_eq!(doc.author, hex::encode(key.identity_hash()));
     assert_eq!(doc.created, 1.5);
 
     let list = client.work_list(&url(), WorkScope::All).await.unwrap();

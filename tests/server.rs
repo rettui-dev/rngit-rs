@@ -653,13 +653,11 @@ async fn work_documents_are_written_read_commented_moved_and_deleted() {
     assert_eq!(viewed.comments.len(), 1);
     assert_eq!(a.work_list(&url(), WorkScope::All).await.unwrap().active[0].comments, 1);
 
-    // Ben edits his proposal (only its author may; Amy may not edit his words), and Amy takes it up.
+    // Ben edits his proposal (its author or an administrator may: see the edit tests), and Amy takes it up.
     b.work_edit(&url(), &ben, 2, WorkScope::Proposed, "Idea!", "Do it now").await.unwrap();
     let edited = b.work_view(&url(), 2, WorkScope::All).await.unwrap();
     assert_eq!((edited.title.as_str(), edited.content.as_str()), ("Idea!", "Do it now"));
     assert!(edited.verified && edited.edited >= edited.created);
-    let not_author = a.work_edit(&url(), &amy, 2, WorkScope::Proposed, "Mine now", "Stolen").await.unwrap_err().to_string();
-    assert!(not_author.contains("not author"), "{not_author}");
     assert_eq!(a.work_activate(&url(), 2).await.unwrap(), (2, "active".into()));
     assert!(tmp.path().join("repos/public/demo.git.work/active/2/root").is_file());
     assert!(!tmp.path().join("repos/public/demo.git.work/proposed/2").exists());
@@ -1291,4 +1289,404 @@ async fn the_owner_manages_what_the_node_hosts_whatever_the_rules() {
     assert!(node.follow_source("team", "ssh.git", "ssh://example.com/x.git", Follows::Fork, None).unwrap_err().contains("Prohibited"));
     assert!(node.follow_source("team", "none.git", "", Follows::Fork, None).is_err());
     assert!(!repos.join("team/ssh.git").exists());
+}
+
+/// What a MessagePack reply says, after its status byte.
+fn reply_value(response: &Response) -> rmpv::Value {
+    match response {
+        Response::Packet(p) if p.first() == Some(&0) => rmpv::decode::read_value(&mut &p[1..]).unwrap(),
+        other => panic!("{:?}", text(other)),
+    }
+}
+
+#[test]
+fn names_that_mean_something_else_on_windows_are_refused() {
+    let (tmp, node, _) = node(&format!("adm:{}", hex::encode(ME)));
+    let ask =
+        |extra: &[(&str, rmpv::Value)]| text(&node.handle("/mgmt/release", &rmpv_request("public/demo.git", extra), Some(ME)).unwrap());
+    let create = |extra: &[(&str, rmpv::Value)]| {
+        let mut all = vec![("operation", rmpv::Value::from("create")), ("tag", rmpv::Value::from("v1"))];
+        all.extend(extra.iter().cloned());
+        ask(&all)
+    };
+    let file = |name: &str| {
+        create(&[("step", "artifact".into()), ("artifact_name", name.into()), ("artifact_data", rmpv::Value::Binary(vec![1]))])
+    };
+    assert_eq!(create(&[("step", "init".into())]).0, 0);
+    let bad = [
+        // A drive (which replaces the folder it is joined to), a stream of another file.
+        "C:secret",
+        "c:..\\x",
+        "ab:c",
+        // What Windows doesn't take in a name, or drops from its end.
+        "a<b",
+        "a>b",
+        "a\"b",
+        "a|b",
+        "a?b",
+        "a*b",
+        "a\u{7f}b",
+        "a\u{1b}b",
+        "ends.",
+        "ends ",
+        // Devices, in any case and with any extension.
+        "CON",
+        "con.txt",
+        "Nul.tar.gz",
+        "aux",
+        "PRN.log",
+        "com1",
+        "COM9.bin",
+        "lpt1",
+        "LPT5.txt",
+        "com\u{b9}",
+        "conin$",
+    ];
+    for name in bad {
+        assert_eq!(file(name).0, 2, "{name:?}");
+        let fetched = ask(&[("operation", "fetch".into()), ("tag", "v1".into()), ("artifact", name.into())]);
+        assert_eq!(fetched.0, 2, "{name:?}");
+    }
+    // Names that only look like those are fine.
+    for name in ["console.txt", "com10", "lpt", "nul-ish", "app 1.0 (linux).tar.gz", "\u{e9}t\u{e9}.txt"] {
+        assert_eq!(file(name).0, 0, "{name:?}");
+    }
+    let kept = std::fs::read_dir(tmp.path().join("repos/public/demo.git.releases/v1/artifacts")).unwrap().count();
+    assert_eq!(kept, 6);
+    // Nothing was written beside the release, or anywhere else in the folder.
+    let releases: Vec<_> =
+        std::fs::read_dir(tmp.path().join("repos/public/demo.git.releases")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(releases, ["v1"]);
+
+    // Tags, groups and repositories are folders, and are checked the same way.
+    for tag in ["con", "NUL", "v1.", "com1.0"] {
+        assert_eq!(ask(&[("operation", "create".into()), ("step", "init".into()), ("tag", tag.into())]).0, 2, "{tag}");
+    }
+    let (open_tmp, open) = open_node();
+    for name in ["public/con.git", "public/NUL.git", "public/com1.git", "public/lpt9.x.git", "aux/x.git", "public./x.git"] {
+        assert_eq!(text(&open.handle("/git/create", &rmpv_request(name, &[]), Some(ME)).unwrap()).0, 2, "{name}");
+    }
+    assert_eq!(std::fs::read_dir(open_tmp.path().join("repos/public")).unwrap().count(), 0);
+}
+
+#[test]
+fn latest_is_no_name_for_a_release() {
+    let (tmp, node, work) = node(&format!("adm:{}", hex::encode(ME)));
+    git(&work, &["tag", "latest"]);
+    git(&work, &["tag", "Latest"]);
+    git(&work, &["push", "-q", tmp.path().join("repos/public/demo.git").to_str().unwrap(), "--tags"]);
+    let ask =
+        |extra: &[(&str, rmpv::Value)]| text(&node.handle("/mgmt/release", &rmpv_request("public/demo.git", extra), Some(ME)).unwrap());
+    let init = |tag: &str| ask(&[("operation", "create".into()), ("step", "init".into()), ("tag", tag.into())]);
+    assert_eq!(init("v1").0, 0);
+    assert_eq!(ask(&[("operation", "create".into()), ("step", "finalize".into()), ("tag", "v1".into())]).0, 0);
+    for tag in ["latest", "Latest"] {
+        let (status, message) = init(tag);
+        assert_eq!(status, 2, "{tag}");
+        assert!(message.contains("latest release"), "{message}");
+    }
+    // The file that names the latest release is as it was, and still works.
+    let releases = tmp.path().join("repos/public/demo.git.releases");
+    assert!(releases.join("latest").is_file());
+    assert_eq!(std::fs::read_to_string(releases.join("latest")).unwrap(), "v1");
+    assert_eq!(ask(&[("operation", "view".into()), ("tag", "latest".into())]).0, 0);
+    assert_eq!(ask(&[("operation", "latest".into()), ("tag", "latest".into())]).0, 2);
+    assert_eq!(ask(&[("operation", "delete".into()), ("tag", "latest".into())]).0, 2);
+    assert!(releases.join("latest").is_file());
+}
+
+#[tokio::test]
+async fn an_edit_keeps_the_signature_of_text_it_leaves_alone_and_administrators_may_edit() {
+    use rngit::client::{WorkKind, WorkScope};
+    use rngit::sign::Signer;
+    let (amy, ben, cat) = (Key::new(1), Key::new(2), Key::new(3));
+    // Amy administers the repository; Ben and Cat may write documents.
+    let (tmp, node, _) = node(&format!("r:all\ni:all\nw:all\nadm:{}", hash_of(&amy)));
+    let (a, b, c) = (as_key(&node, &amy), as_key(&node, &ben), as_key(&node, &cat));
+    let (id, _) = b.work_create(&url(), &ben, WorkKind::Create, "Plan", "The plan", "markdown").await.unwrap();
+    let view = || async { b.work_view(&url(), id, WorkScope::All).await.unwrap() };
+
+    // A new title alone (the text sent empty, signed as sent) keeps Ben's text and his signature over it.
+    b.work_edit(&url(), &ben, id, WorkScope::Active, "Better plan", "").await.unwrap();
+    let doc = view().await;
+    assert_eq!((doc.title.as_str(), doc.content.as_str()), ("Better plan", "The plan"));
+    assert!(doc.verified, "{doc:?}");
+    assert_eq!(doc.identity, Some(ben.public_key()));
+    // So does one that sends the same text again.
+    b.work_edit(&url(), &ben, id, WorkScope::Active, "Best plan", "The plan").await.unwrap();
+    assert!(view().await.verified);
+
+    // New text is kept exactly as it was signed, space and all.
+    b.work_edit(&url(), &ben, id, WorkScope::Active, "", "  Step one\nStep two\n").await.unwrap();
+    let doc = view().await;
+    assert_eq!((doc.title.as_str(), doc.content.as_str()), ("Best plan", "  Step one\nStep two\n"));
+    assert!(doc.verified, "{doc:?}");
+    let root = std::fs::read(tmp.path().join("repos/public/demo.git.work/active/1/root")).unwrap();
+    assert!(root.windows(b"  Step one\nStep two\n".len()).any(|w| w == b"  Step one\nStep two\n"));
+
+    // Amy, an administrator, may retitle it, and Ben's signature stays.
+    a.work_edit(&url(), &amy, id, WorkScope::Active, "Agreed plan", "").await.unwrap();
+    let doc = view().await;
+    assert_eq!(doc.title, "Agreed plan");
+    assert!(doc.verified && doc.identity == Some(ben.public_key()), "{doc:?}");
+    // And change the text, which she then signs with her own key; the author stays Ben.
+    a.work_edit(&url(), &amy, id, WorkScope::Active, "", "Amended").await.unwrap();
+    let doc = view().await;
+    assert_eq!(doc.content, "Amended");
+    assert_eq!((doc.identity, doc.author.as_str()), (Some(amy.public_key()), hash_of(&ben).as_str()));
+    assert!(rngit::sign::verify_signature(&amy.public_key(), b"Amended", &doc.signature.unwrap()).is_ok());
+
+    // Cat may write documents, but this one is neither hers nor hers to administer.
+    let refused = c.work_edit(&url(), &cat, id, WorkScope::Active, "Mine", "Stolen").await.unwrap_err().to_string();
+    assert!(refused.contains("not author"), "{refused}");
+    // A signature that isn't over the text sent is refused, even for a title alone.
+    let forged = a.work_edit(&url(), &ben, id, WorkScope::Active, "Forged", "").await.unwrap_err().to_string();
+    assert!(forged.contains("Invalid signature"), "{forged}");
+    assert_eq!(view().await.title, "Agreed plan");
+}
+
+#[test]
+fn lists_and_views_stay_within_one_reply() {
+    use rngit::sign::Signer;
+    let amy = Key::new(1);
+    let (tmp, node, _) = node(&format!("r:all\ni:all\nadm:{}", hash_of(&amy)));
+    let sender = Sender { hash: amy.identity_hash(), key: Some(amy.public_key()) };
+    let ask =
+        |extra: &[(&str, rmpv::Value)]| node.handle_from("/mgmt/work", &rmpv_request("public/demo.git", extra), Some(sender)).unwrap();
+    let signature = |text: &str| rmpv::Value::Binary(amy.sign(text.as_bytes()).unwrap().to_vec());
+    let title = "t".repeat(10_000);
+    let made = ask(&[
+        ("operation", "create".into()),
+        ("title", title.as_str().into()),
+        ("content", "text".into()),
+        ("signature", signature("text")),
+    ]);
+    assert_eq!(text(&made).0, 0);
+
+    // A list shows the start of a long title; a view shows it whole.
+    let list = reply_value(&ask(&[("operation", "list".into()), ("scope", "all".into())]));
+    let listed = rngit::wire::MapRef::new(&list).unwrap().array("active")[0].clone();
+    assert_eq!(rngit::wire::MapRef::new(&listed).unwrap().str("title").unwrap().chars().count(), 200);
+
+    // Comments that come to more than one reply holds: the newest are shown, whole.
+    let doc = tmp.path().join("repos/public/demo.git.work/active/1");
+    let big = "c".repeat(1024 * 1024);
+    for n in 1..=12u64 {
+        let comment = rmpv::Value::Map(vec![
+            ("content".into(), format!("{n} {big}").into()),
+            (
+                "meta".into(),
+                rmpv::Value::Map(vec![("format".into(), "markdown".into()), ("author".into(), rmpv::Value::Binary(vec![1; 16]))]),
+            ),
+        ]);
+        let mut bytes = Vec::new();
+        rmpv::encode::write_value(&mut bytes, &comment).unwrap();
+        std::fs::write(doc.join(n.to_string()), bytes).unwrap();
+    }
+    let viewed = ask(&[("operation", "view".into()), ("doc_id", 1.into())]);
+    let Response::Packet(bytes) = &viewed else { panic!() };
+    assert!(bytes.len() <= 8 * 1024 * 1024, "{}", bytes.len());
+    let viewed = reply_value(&viewed);
+    let viewed = rngit::wire::MapRef::new(&viewed).unwrap();
+    let comments = viewed.array("comments");
+    assert!(comments.len() >= 6 && comments.len() < 12, "{}", comments.len());
+    let ids: Vec<u64> = comments.iter().map(|c| rngit::wire::MapRef::new(c).unwrap().u64("id").unwrap()).collect();
+    assert_eq!(ids.last(), Some(&12));
+    assert!(ids.windows(2).all(|w| w[0] + 1 == w[1]), "{ids:?}");
+    for (c, id) in comments.iter().zip(ids) {
+        assert_eq!(rngit::wire::MapRef::new(c).unwrap().str("content").unwrap(), format!("{id} {big}"));
+    }
+}
+
+#[tokio::test]
+async fn a_release_list_shows_the_start_of_long_notes() {
+    let (_tmp, node, _) = node(&format!("r:all\nrel:{}", hex::encode(ME)));
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+    let notes = "\u{e9}".repeat(5000);
+    me.create_release(&url(), &Key::new(5), "v1", None, &notes, &[], "2026-10-26T00:00:00Z", 1_700_000_000).await.unwrap();
+    let list = me.releases(&url()).await.unwrap();
+    assert_eq!(list.releases[0].preview.chars().count(), 1000);
+    assert_eq!(me.release(&url(), "v1").await.unwrap().notes, notes);
+}
+
+#[test]
+fn fetches_take_turns_building_and_all_get_their_bundle() {
+    let (_tmp, mut node, _) = node("r:all");
+    node.max_bundle_builds = 1;
+    let asks = [
+        vec!["refs/heads/main"],
+        vec!["refs/heads/topic"],
+        vec!["refs/tags/v1"],
+        vec!["refs/tags/v2"],
+        vec!["refs/heads/main", "refs/heads/topic"],
+        vec!["refs/heads/main", "refs/tags/v1"],
+        vec!["refs/heads/topic", "refs/tags/v2"],
+        vec!["refs/heads/main", "refs/heads/topic", "refs/tags/v1", "refs/tags/v2"],
+    ];
+    let replies: Vec<Response> = std::thread::scope(|scope| {
+        let running: Vec<_> =
+            asks.iter().map(|refs| scope.spawn(|| node.handle("/git/fetch", &fetch_of(refs), Some(ME)).unwrap())).collect();
+        running.into_iter().map(|t| t.join().unwrap()).collect()
+    });
+    for reply in &replies {
+        assert!(matches!(reply, Response::File { data, .. } if data.starts_with(b"# v2 git bundle")), "{:?}", text(reply));
+    }
+    assert_eq!(node.cached_bundles(), asks.len());
+    // Asked again, each comes from what was kept, the same as before.
+    assert_eq!(node.handle("/git/fetch", &fetch_of(&asks[7]), Some(ME)).unwrap(), replies[7]);
+}
+
+#[test]
+fn a_refused_push_leaves_nothing_on_disk() {
+    let (tmp, node) = open_node();
+    let work = tmp.path().join("work");
+    work_repo(&work, 2);
+    assert_eq!(text(&node.handle("/git/create", &rmpv_request("public/new.git", &[]), Some(ME)).unwrap()).0, 0);
+    let push = |force: bool| {
+        let repo = gix::open(&work).unwrap();
+        let bundle = rngit::bundle::build(&repo, "refs/heads/main", None).unwrap();
+        let request = rmpv_request(
+            "public/new.git",
+            &[
+                ("remote_ref", rmpv::Value::from("refs/heads/main")),
+                ("force", rmpv::Value::Boolean(force)),
+                ("bundle", rmpv::Value::Binary(bundle)),
+            ],
+        );
+        text(&node.handle("/git/push", &request, Some(ME)).unwrap())
+    };
+    assert_eq!(push(false).0, 0);
+    let packs = served(&tmp).join("objects/pack");
+    let listing = || {
+        let mut names: Vec<_> = std::fs::read_dir(&packs).unwrap().flatten().map(|e| e.file_name()).collect();
+        names.sort();
+        names
+    };
+    let before = listing();
+    // Something unrelated, pushed again and again without force: each is turned down and takes nothing.
+    git(&work, &["checkout", "-q", "--orphan", "other"]);
+    for n in 0..3 {
+        std::fs::write(work.join("x.txt"), format!("unrelated {n}")).unwrap();
+        git(&work, &["add", "."]);
+        git(&work, &["commit", "-q", "-m", "unrelated"]);
+        git(&work, &["branch", "-f", "main"]);
+        assert_eq!(push(false), (0xff, "Could not verify bundle".into()));
+        assert_eq!(listing(), before);
+    }
+    git(&served(&tmp), &["fsck", "--strict"]);
+    // Forced, it is kept.
+    assert_eq!(push(true).0, 0);
+    assert_ne!(listing(), before);
+    git(&served(&tmp), &["fsck", "--strict"]);
+}
+
+#[test]
+fn a_repository_is_not_made_over_what_an_older_one_left() {
+    for left in ["new.git.work", "new.git.releases", "new.git.allowed"] {
+        let (tmp, node) = open_node();
+        let path = tmp.path().join("repos/public").join(left);
+        if left.ends_with(".allowed") {
+            std::fs::write(&path, "adm:00000000000000000000000000000001").unwrap();
+        } else {
+            std::fs::create_dir_all(path.join("active/1")).unwrap();
+        }
+        let (status, message) = text(&node.handle("/git/create", &rmpv_request("public/new.git", &[]), Some(ME)).unwrap());
+        assert_eq!(status, 1, "{left}: {message}");
+        assert!(message.contains("still there"), "{message}");
+        assert!(!served(&tmp).exists());
+        // What was there is as it was.
+        if left.ends_with(".allowed") {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "adm:00000000000000000000000000000001");
+        } else {
+            assert!(path.join("active/1").is_dir());
+        }
+    }
+}
+
+/// Fetches as [`Local`] does, but first, as if at the same moment, another
+/// peer asks for a repository of the same name.
+#[derive(Debug)]
+struct Racing {
+    fetch: Local,
+    rival: Node,
+    answer: std::sync::Mutex<Option<(u8, String)>>,
+}
+
+impl rngit::server::Upstream for Racing {
+    fn pull(&self, source: &RepoUrl, dest: &std::path::Path, timeout: std::time::Duration) -> Result<(), String> {
+        let made = self.rival.handle("/git/create", &rmpv_request("public/new.git", &[]), Some([9; 16])).unwrap();
+        *self.answer.lock().unwrap() = Some(text(&made));
+        self.fetch.pull(source, dest, timeout)
+    }
+}
+
+#[tokio::test]
+async fn a_fork_claims_its_name_and_never_touches_rules_it_did_not_write() {
+    let (_source_tmp, source, _work) = node("r:all");
+    let (tmp, mut node) = open_node();
+    node.default_rules = Rule::parse("c:all, r:all");
+    let racing = std::sync::Arc::new(Racing {
+        fetch: Local { source: source.clone(), peer: ME },
+        rival: node.clone(),
+        answer: std::sync::Mutex::new(None),
+    });
+    node.upstream = Some(racing.clone());
+    let me = Client::new(Direct { node: node.clone(), peer: Some(ME), key: None });
+
+    // While the fork fetches, the name is taken: the other peer's create is turned away,
+    // and the rules are the fork's maker's alone.
+    me.fork(&new_url(), &source_url()).await.unwrap();
+    assert_eq!(racing.answer.lock().unwrap().clone(), Some((1, "Repository already exists".into())));
+    assert_eq!(std::fs::read_to_string(tmp.path().join("repos/public/new.git.allowed")).unwrap(), format!("adm:{}", hex::encode(ME)));
+    git(&served(&tmp), &["fsck", "--strict"]);
+
+    // Rules left by an older repository of a name stop a fork there, and stay as they were.
+    let other: RepoUrl = "rns://00112233445566778899aabbccddeeff/public/other".parse().unwrap();
+    let rules = tmp.path().join("repos/public/other.git.allowed");
+    std::fs::write(&rules, "adm:00000000000000000000000000000001").unwrap();
+    let refused = me.fork(&other, &source_url()).await.unwrap_err().to_string();
+    assert!(refused.contains("still there"), "{refused}");
+    assert_eq!(std::fs::read_to_string(&rules).unwrap(), "adm:00000000000000000000000000000001");
+    assert!(!tmp.path().join("repos/public/other.git").exists());
+
+    // A fork whose fetch fails gives the name up again, and writes no rules.
+    std::fs::remove_file(&rules).unwrap();
+    let missing = "rns://00112233445566778899aabbccddeeff/public/missing";
+    assert!(me.fork(&other, missing).await.is_err());
+    assert!(!tmp.path().join("repos/public/other.git").exists());
+    assert!(!rules.exists());
+    me.fork(&other, &source_url()).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_source_says_what_this_node_takes() {
+    let (_source_tmp, source, _work) = node("r:all");
+    let (_tmp, node) = following(&source);
+    let me = Client::new(Direct { node, peer: Some(ME), key: None });
+    let refused = me.fork(&new_url(), "ssh://example.com/x.git").await.unwrap_err().to_string();
+    assert!(refused.contains("Prohibited source URL") && refused.contains("rns://"), "{refused}");
+    assert_eq!(refused.contains("rns:// and https://"), cfg!(feature = "https"), "{refused}");
+}
+
+#[cfg(feature = "https")]
+#[tokio::test]
+async fn https_sources_that_reach_a_private_address_another_way_are_refused() {
+    let (_tmp, node) = open_node();
+    let me = Client::new(Direct { node, peer: Some(ME), key: None });
+    for source in [
+        "https://[64:ff9b::7f00:1]/a.git",
+        "https://[64:ff9b::a9fe:a9fe]/latest",
+        "https://[2002:7f00:1::1]/a.git",
+        "https://[2002:c0a8:101::1]/a.git",
+        "https://[::7f00:1]/a.git",
+        "https://[fec0::1]/a.git",
+        "https://198.18.0.1/a.git",
+        "https://192.0.0.8/a.git",
+        "https://100.100.100.100/a.git",
+        "https://224.0.0.1/a.git",
+        "https://255.255.255.255/a.git",
+    ] {
+        let refused = me.mirror(&new_url(), source).await.unwrap_err().to_string();
+        assert!(refused.contains("isn't a public address"), "{source}: {refused}");
+    }
 }

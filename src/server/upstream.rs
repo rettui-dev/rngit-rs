@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use rmpv::Value;
 
-use super::support::{now, refuse, write_file};
+use super::support::{claim, nothing_left_behind, now, refuse, write_file, write_new};
 use super::{Node, Perm, Refusal, ack, dir_size, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -126,6 +126,12 @@ fn named_source(map: &MapRef, open: bool) -> Result<(String, Source), Refusal> {
     checked_source(&source, open).map(|parsed| (source, parsed))
 }
 
+/// What a node fetches forks and mirrors from, as its errors say it.
+#[cfg(feature = "https")]
+const SOURCES: &str = "rns:// and https:// repositories";
+#[cfg(not(feature = "https"))]
+const SOURCES: &str = "rns:// repositories (it was built without https:// sources)";
+
 /// A source as written, if it is one this node fetches from.
 pub(super) fn checked_source(source: &str, open: bool) -> Result<Source, Refusal> {
     if source.is_empty() {
@@ -144,7 +150,17 @@ pub(super) fn checked_source(source: &str, open: bool) -> Result<Source, Refusal
         }
     }
     let _ = open;
-    Err(refuse(Status::NotAllowed, "Prohibited source URL: this node forks and mirrors from rns:// and https:// repositories only"))
+    Err(refuse(Status::NotAllowed, &format!("Prohibited source URL: this node forks and mirrors from {SOURCES} only")))
+}
+
+/// Move the repository made at `tmp` into `claimed`, the empty folder that
+/// claims its name, and say whether it went. Most systems replace an empty
+/// folder in one step; where one doesn't (Windows), the claim is given up
+/// first, and if another request takes the name in that moment the move
+/// fails and what it made there is left alone. Whether it went or not, the
+/// claim is no longer this one's to remove.
+fn move_into_claim(tmp: &Path, claimed: &Path) -> bool {
+    std::fs::rename(tmp, claimed).is_ok() || (std::fs::remove_dir(claimed).is_ok() && std::fs::rename(tmp, claimed).is_ok())
 }
 
 /// The branches and tags a repository has.
@@ -243,7 +259,11 @@ impl Node {
         if matches!(source, Source::Rns(_)) {
             self.upstream_or_refuse()?;
         }
+        nothing_left_behind(group_dir, repo)?;
 
+        // The empty folder claims the name while the fetch runs, so no other
+        // request makes a repository there meanwhile.
+        claim(&final_dir)?;
         // Made beside where it will be, under a name nothing serves, and moved into place once whole.
         let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let tmp = group_dir.join(format!(".{}-{nanos}.part", kind.word()));
@@ -251,24 +271,27 @@ impl Node {
             gix::init_bare(&tmp).map_err(|_| refuse(Status::ServerError, "Failed to initialize repository"))?;
             self.pull_into(source, &tmp, false).map_err(|e| refuse(Status::ServerError, &format!("Failed to fetch from source: {e}")))?;
             write_following(&tmp, Some(kind), written, now())
-                .map_err(|()| refuse(Status::ServerError, "Failed to configure repository type"))?;
-            let allowed = group_dir.join(format!("{repo}.allowed"));
-            if let Some(admin) = admin {
-                write_file(&allowed, format!("adm:{}", hex::encode(admin)).as_bytes())
-                    .map_err(|_| refuse(Status::ServerError, "Could not initialize repository"))?;
-            }
-            if final_dir.exists() || std::fs::rename(&tmp, &final_dir).is_err() {
-                if admin.is_some() {
-                    let _ = std::fs::remove_file(&allowed);
-                }
-                return Err(refuse(Status::ServerError, "Could not write repository"));
-            }
-            Ok(())
+                .map_err(|()| refuse(Status::ServerError, "Failed to configure repository type"))
         })();
-        if made.is_err() {
+        if let Err(refusal) = made {
             let _ = std::fs::remove_dir_all(&tmp);
+            // The claim is still this request's: nothing else makes a repository there.
+            let _ = std::fs::remove_dir(&final_dir);
+            return Err(refusal);
         }
-        made
+        if !move_into_claim(&tmp, &final_dir) {
+            let _ = std::fs::remove_dir_all(&tmp);
+            return Err(refuse(Status::ServerError, "Could not write repository"));
+        }
+        // The rules go in only once the repository is in place, and never over others'.
+        if let Some(admin) = admin
+            && write_new(&group_dir.join(format!("{repo}.allowed")), format!("adm:{}", hex::encode(admin)).as_bytes()).is_err()
+        {
+            // The repository is this request's own, made a moment ago.
+            let _ = std::fs::remove_dir_all(&final_dir);
+            return Err(refuse(Status::ServerError, "Could not initialize repository"));
+        }
+        Ok(())
     }
 
     /// `/git/sync`: follow the source of a fork or mirror again.
@@ -295,7 +318,9 @@ impl Node {
     }
 
     pub(super) fn follow(&self, dir: &Path, following: &Following) -> Result<(), String> {
-        let source = Source::parse(&following.source).ok_or("The source isn't an rns:// or https:// repository")?;
+        let source = Source::parse(&following.source).ok_or_else(|| format!("The source isn't one of the {SOURCES} this node fetches"))?;
+        // A sync adds packs as a push does: one writer at a time.
+        let _held = self.writing.hold(dir, self.max_request_time).ok_or("The repository is busy, try again later")?;
         // A fork's HEAD is its keeper's to move; the pull sets it from the source's.
         let head = (following.kind == Follows::Fork).then(|| std::fs::read(dir.join("HEAD")).ok()).flatten();
         let before = if self.prune_synced { local_refs(dir) } else { Vec::new() };

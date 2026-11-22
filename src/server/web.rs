@@ -51,14 +51,30 @@ fn http_host(source: &str) -> Option<String> {
     Some(url.host_str()?.trim_matches(['[', ']']).to_ascii_lowercase())
 }
 
-/// Whether an address is one on the open internet.
+/// Whether an address is one on the open internet. An IPv6 address that
+/// carries an IPv4 one (mapped, NAT64, 6to4) is judged by that too.
 fn public(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => public_v4(v4),
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => public_v4(v4),
+        IpAddr::V6(v6) => match embedded_v4(v6) {
+            Some(v4) => public_v4(v4) && public_v6(v6),
             None => public_v6(v6),
         },
+    }
+}
+
+/// The IPv4 address an IPv6 one stands for, if it is made from one.
+fn embedded_v4(ip: Ipv6Addr) -> Option<Ipv4Addr> {
+    let s = ip.segments();
+    let low = Ipv4Addr::new((s[6] >> 8) as u8, s[6] as u8, (s[7] >> 8) as u8, s[7] as u8);
+    match s {
+        // ::ffff:a.b.c.d, mapped.
+        [0, 0, 0, 0, 0, 0xffff, ..] => Some(low),
+        // 64:ff9b::a.b.c.d, NAT64's well-known prefix: a gateway reaches the IPv4 address.
+        [0x64, 0xff9b, 0, 0, 0, 0, ..] => Some(low),
+        // 2002:aabb:ccdd::/48, 6to4: the IPv4 address follows the prefix.
+        [0x2002, high, low_half, ..] => Some(Ipv4Addr::new((high >> 8) as u8, high as u8, (low_half >> 8) as u8, low_half as u8)),
+        _ => None,
     }
 }
 
@@ -71,14 +87,45 @@ fn public_v4(ip: Ipv4Addr) -> bool {
         || ip.is_broadcast()
         || ip.is_documentation()
         || ip.is_multicast()
+        // 0.0.0.0/8, "this network".
         || o[0] == 0
+        // 100.64.0.0/10, carrier-grade NAT.
         || (o[0] == 100 && (64..128).contains(&o[1]))
+        // 192.0.0.0/24, protocol assignments.
+        || (o[0] == 192 && o[1] == 0 && o[2] == 0)
+        // 192.88.99.0/24, the old 6to4 relays.
+        || (o[0] == 192 && o[1] == 88 && o[2] == 99)
+        // 198.18.0.0/15, benchmarking.
+        || (o[0] == 198 && (o[1] == 18 || o[1] == 19))
+        // 240.0.0.0/4, reserved, and the broadcast address in it.
         || o[0] >= 240)
 }
 
 fn public_v6(ip: Ipv6Addr) -> bool {
-    let first = ip.segments()[0];
-    !(ip.is_loopback() || ip.is_unspecified() || ip.is_multicast() || first & 0xfe00 == 0xfc00 || first & 0xffc0 == 0xfe80)
+    let s = ip.segments();
+    !(ip.is_loopback()
+        || ip.is_unspecified()
+        || ip.is_multicast()
+        // fc00::/7, unique local.
+        || s[0] & 0xfe00 == 0xfc00
+        // fe80::/10, link-local, and fec0::/10, the old site-local.
+        || s[0] & 0xffc0 == 0xfe80
+        || s[0] & 0xffc0 == 0xfec0
+        // ::a.b.c.d, the old IPv4-compatible form, which nothing routes (with :: and ::1).
+        || matches!(s, [0, 0, 0, 0, 0, 0, ..])
+        // ::ffff:0:a.b.c.d, IPv4-translated.
+        || matches!(s, [0, 0, 0, 0, 0xffff, 0, ..])
+        // 64:ff9b:1::/48, NAT64 for local use.
+        || (s[0] == 0x64 && s[1] == 0xff9b && s[2] == 1)
+        // 100::/64, discard.
+        || matches!(s, [0x100, 0, 0, 0, ..])
+        // 2001::/23, protocol assignments (Teredo among them), and 2001:db8::/32, documentation.
+        || (s[0] == 0x2001 && s[1] < 0x200)
+        || (s[0] == 0x2001 && s[1] == 0xdb8)
+        // 3fff::/20, documentation.
+        || (s[0] == 0x3fff && s[1] < 0x1000)
+        // 5f00::/16, segment routing.
+        || s[0] == 0x5f00)
 }
 
 /// Fetch every branch and tag of `source` into the bare repository at `dest`
@@ -296,10 +343,37 @@ mod tests {
             "fd00::1",
             "fe80::1",
             "::ffff:10.0.0.1",
+            // NAT64 and 6to4 of private and loopback addresses.
+            "64:ff9b::7f00:1",
+            "64:ff9b::a9fe:a9fe",
+            "64:ff9b:1::808:808",
+            "2002:7f00:1::1",
+            "2002:c0a8:101::",
+            // IPv4-compatible and -translated.
+            "::8.8.8.8",
+            "::7f00:1",
+            "::ffff:0:808:808",
+            "fec0::1",
+            "100::1",
+            "2001::1",
+            "2001:db8::1",
+            "3fff::1",
+            "5f00::1",
+            "ff02::1",
+            "198.18.0.1",
+            "198.19.255.255",
+            "192.0.0.8",
+            "192.88.99.1",
+            "100.127.255.255",
+            "224.0.0.1",
+            "255.255.255.255",
+            "240.0.0.1",
         ] {
             assert!(!public(ip.parse().unwrap()), "{ip}");
         }
-        for ip in ["8.8.8.8", "140.82.112.3", "2606:4700::1111"] {
+        for ip in
+            ["8.8.8.8", "140.82.112.3", "2606:4700::1111", "64:ff9b::808:808", "2002:808:808::1", "2001:4860:4860::8888", "198.20.0.1"]
+        {
             assert!(public(ip.parse().unwrap()), "{ip}");
         }
     }

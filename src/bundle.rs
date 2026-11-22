@@ -78,9 +78,14 @@ pub(crate) fn valid_ref_name(name: &str) -> bool {
 
 /// Write the bundle's pack into `repo` without touching any ref. Returns the
 /// refs the bundle names, each checked to exist in `repo` afterwards.
+///
+/// Besides refs under `refs/`, the bundle may name `HEAD`, as the push
+/// bundles stock rngit makes do (`<new sha> HEAD`). That is fine here
+/// because nothing is written from the names: a node takes the ref being
+/// pushed from the request, and git sets the refs a remote helper fetched.
 pub fn ingest_objects(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(ObjectId, String)>> {
     let header = parse_header(data)?;
-    ingest_objects_with(repo, data, header, &NO_INTERRUPT)
+    ingest_objects_with(repo, data, header, &NO_INTERRUPT, true)
 }
 
 fn ingest_objects_with(
@@ -88,9 +93,10 @@ fn ingest_objects_with(
     data: &[u8],
     header: BundleHeader,
     interrupt: &AtomicBool,
+    allow_head: bool,
 ) -> Result<Vec<(ObjectId, String)>> {
     for (_, name) in &header.refs {
-        if !valid_ref_name(name) {
+        if !(valid_ref_name(name) || (allow_head && name == "HEAD")) {
             return Err(Error::Protocol(format!("bundle names an unsafe ref: {name:?}")));
         }
     }
@@ -209,12 +215,22 @@ pub fn check_pack(mut pack: &[u8], hash: gix::hash::Kind, limits: PackLimits) ->
 }
 
 /// [`ingest_objects`], refusing a pack over `limits` first and giving up
-/// soon after `interrupt` is set.
+/// soon after `interrupt` is set. Like it, this accepts a `HEAD` line.
 pub fn ingest_objects_checked(
     repo: &gix::Repository,
     data: &[u8],
     limits: PackLimits,
     interrupt: &AtomicBool,
+) -> Result<Vec<(ObjectId, String)>> {
+    ingest_checked_with(repo, data, limits, interrupt, true)
+}
+
+fn ingest_checked_with(
+    repo: &gix::Repository,
+    data: &[u8],
+    limits: PackLimits,
+    interrupt: &AtomicBool,
+    allow_head: bool,
 ) -> Result<Vec<(ObjectId, String)>> {
     let header = parse_header(data)?;
     let pack = &data[header.pack_offset..];
@@ -222,21 +238,49 @@ pub fn ingest_objects_checked(
     if !pack.is_empty() {
         check_pack(pack, repo.object_hash(), limits)?;
     }
-    ingest_objects_with(repo, data, header, interrupt)
+    ingest_objects_with(repo, data, header, interrupt, allow_head)
 }
 
 /// Write the bundle's pack into `repo` and point its refs at the new tips.
-/// Returns the refs that were set. Nothing limits what the pack unpacks to:
-/// for a bundle from a node, use [`ingest_checked`].
+/// Returns the refs that were set. Every ref the bundle names is set, and
+/// nothing limits what the pack unpacks to: for a bundle from a node, use
+/// [`ingest_wanted`].
 pub fn ingest(repo: &gix::Repository, data: &[u8]) -> Result<Vec<(ObjectId, String)>> {
-    let refs = ingest_objects(repo, data)?;
+    let header = parse_header(data)?;
+    let refs = ingest_objects_with(repo, data, header, &NO_INTERRUPT, false)?;
     set_refs(repo, &refs)?;
     Ok(refs)
 }
 
-/// [`ingest`], refusing a pack over `limits` first.
+/// [`ingest`], refusing a pack over `limits` first. Every ref the bundle
+/// names is still set: for a bundle from a node, use [`ingest_wanted`].
 pub fn ingest_checked(repo: &gix::Repository, data: &[u8], limits: PackLimits) -> Result<Vec<(ObjectId, String)>> {
-    let refs = ingest_objects_checked(repo, data, limits, &NO_INTERRUPT)?;
+    let refs = ingest_checked_with(repo, data, limits, &NO_INTERRUPT, false)?;
+    set_refs(repo, &refs)?;
+    Ok(refs)
+}
+
+/// [`ingest_checked`] for a bundle from a node that was asked for `wanted`
+/// refs: only those refs are set, so a node can't add `refs/stash`, notes or
+/// anything else to the repository by naming them in the bundle. Each entry
+/// is a full ref name and, when known, the object the node listed for it;
+/// a bundle that points a wanted ref anywhere else is refused before any ref
+/// is set. A wanted ref the bundle leaves out is not set. Returns the refs
+/// that were set.
+pub fn ingest_wanted(
+    repo: &gix::Repository,
+    data: &[u8],
+    limits: PackLimits,
+    wanted: &[(&str, Option<ObjectId>)],
+) -> Result<Vec<(ObjectId, String)>> {
+    let mut refs = ingest_checked_with(repo, data, limits, &NO_INTERRUPT, false)?;
+    refs.retain(|(_, name)| wanted.iter().any(|(want, _)| want == name));
+    for (id, name) in &refs {
+        let listed = wanted.iter().find(|(want, _)| want == name).and_then(|(_, sha)| *sha);
+        if listed.is_some_and(|sha| sha != *id) {
+            return Err(Error::Protocol(format!("bundle points {name} at {id}, not at what the node listed")));
+        }
+    }
     set_refs(repo, &refs)?;
     Ok(refs)
 }
@@ -360,6 +404,52 @@ pub fn build_many_until(
     others: &[ObjectId],
     interrupt: &AtomicBool,
 ) -> Result<Vec<u8>> {
+    build_into(repo, wants, others, interrupt, usize::MAX)
+}
+
+/// [`build_many_until`], giving up as soon as the bundle grows past
+/// `max_bytes`, with [`Error::TooLarge`] (`what` is `"bundle"`), so a node
+/// doesn't build a bundle in memory that it would refuse to send.
+pub fn build_capped(
+    repo: &gix::Repository,
+    wants: &[(&str, Option<ObjectId>)],
+    others: &[ObjectId],
+    interrupt: &AtomicBool,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
+    build_into(repo, wants, others, interrupt, max_bytes)
+}
+
+/// Appends to a buffer and fails a write that would take it past `max`.
+struct Capped<'a> {
+    out: &'a mut Vec<u8>,
+    max: usize,
+    /// Set once a write was refused.
+    over: bool,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        if self.out.len().saturating_add(data.len()) > self.max {
+            self.over = true;
+            return Err(std::io::Error::other("over the size limit"));
+        }
+        self.out.extend_from_slice(data);
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn build_into(
+    repo: &gix::Repository,
+    wants: &[(&str, Option<ObjectId>)],
+    others: &[ObjectId],
+    interrupt: &AtomicBool,
+    max_bytes: usize,
+) -> Result<Vec<u8>> {
     use std::sync::atomic::Ordering;
     let stopped = || Error::Git("took too long".into());
     let mut tags = Vec::new();
@@ -431,18 +521,30 @@ pub fn build_many_until(
         writeln!(out, "{direct} {refname}").map_err(Error::git)?;
     }
     writeln!(out).map_err(Error::git)?;
+    let too_large = |size: usize| Error::TooLarge { what: "bundle", size, limit: max_bytes };
+    if out.len() > max_bytes {
+        return Err(too_large(out.len()));
+    }
+    let mut capped = Capped { out: &mut out, max: max_bytes, over: false };
     let writer = output::bytes::FromEntriesIter::new(
         entries.map(|r| r.map(|(_, e)| e)),
-        &mut out,
+        &mut capped,
         count,
         gix_pack::data::Version::V2,
         repo.object_hash(),
     );
+    let mut failed = None;
     for step in writer {
         if interrupt.load(Ordering::Relaxed) {
             return Err(stopped());
         }
-        step.map_err(Error::git)?;
+        if let Err(e) = step {
+            failed = Some(e);
+            break;
+        }
+    }
+    if let Some(e) = failed {
+        return Err(if capped.over { too_large(max_bytes.saturating_add(1)) } else { Error::git(e) });
     }
     Ok(out)
 }

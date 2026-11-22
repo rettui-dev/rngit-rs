@@ -24,6 +24,7 @@ use crate::bundle;
 use crate::error::Status;
 use crate::transport::Response;
 use crate::wire::{self, MapRef};
+use support::write_file;
 
 pub use owner::Hosted;
 pub use upstream::{Following, Follows, Upstream};
@@ -51,6 +52,8 @@ const MAX_OPERATIONS: usize = 1000;
 const MAX_REQUEST_BYTES: usize = 1024 * 1024;
 /// Largest `.allowed` file read.
 const MAX_RULES_BYTES: u64 = 64 * 1024;
+/// Longest a fetch waits for a turn to build its bundle, at most.
+const BUILD_WAIT: Duration = Duration::from_secs(30);
 
 /// What an identity may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -148,6 +151,13 @@ pub struct Node {
     pub quotas: Quotas,
     /// Bundles built lately, so a second clone of the same thing costs nothing.
     cache: Arc<Mutex<BundleCache>>,
+    /// Most bundles built at once. A bundle is built whole in memory, so
+    /// this bounds what fetches can take; the others wait their turn.
+    pub max_bundle_builds: usize,
+    /// The bundles being built.
+    building: Arc<support::Slots>,
+    /// The repositories being written by a push or a sync.
+    writing: Arc<support::Locks>,
     /// Held while a work document is written, so two never get one number.
     working: Arc<Mutex<()>>,
     /// What fetches from other nodes, for forks, mirrors and syncs. Without
@@ -259,7 +269,13 @@ impl Node {
     }
 
     pub fn new(root: PathBuf) -> Self {
-        Node { root, max_bundle_bytes: 256 * 1024 * 1024, max_request_time: Duration::from_secs(120), ..Node::default() }
+        Node {
+            root,
+            max_bundle_bytes: 256 * 1024 * 1024,
+            max_request_time: Duration::from_secs(120),
+            max_bundle_builds: 2,
+            ..Node::default()
+        }
     }
 
     /// Answer one request. `peer` is the identity hash the sender proved on
@@ -425,31 +441,58 @@ impl Node {
             key_refs.push((name.to_string(), id, *have));
         }
         let key: CacheKey = (repo.git_dir().to_path_buf(), key_refs, others.clone());
-        let cached = self.cache.lock().ok().and_then(|mut cache| cache.get(&key));
-        let data = match cached {
+        let data = match self.cached(&key)? {
             Some(data) => data,
             None => {
-                let data = Arc::new(self.build_in_time(&repo, &wants, &others)?);
-                if let Ok(mut cache) = self.cache.lock() {
-                    cache.put(key, data.clone());
+                // Each build holds its bundle in memory: only so many at once.
+                let wait = BUILD_WAIT.min(self.max_request_time);
+                let _turn = self
+                    .building
+                    .take(self.max_bundle_builds.max(1), wait)
+                    .ok_or(Refusal::new(Status::ServerError, "The node is busy building other bundles, try again later"))?;
+                // Another fetch may have built the same one while this waited.
+                match self.cached(&key)? {
+                    Some(data) => data,
+                    None => {
+                        let data = self.build_in_time(&repo, &wants, &others)?;
+                        if data.len() > self.max_bundle_bytes {
+                            return Err(Refusal::new(Status::ServerError, "Bundle is too large"));
+                        }
+                        let data = Arc::new(data);
+                        if let Ok(mut cache) = self.cache.lock() {
+                            cache.put(key, data.clone());
+                        }
+                        // A bundle too big to keep is sent as it is, not copied.
+                        Arc::try_unwrap(data).unwrap_or_else(|kept| kept.as_ref().clone())
+                    }
                 }
-                data
             }
         };
-        if data.len() > self.max_bundle_bytes {
-            return Err(Refusal::new(Status::ServerError, "Bundle is too large"));
-        }
-        let data = data.as_ref().clone();
         let mut metadata = Vec::new();
         rmpv::encode::write_value(&mut metadata, &Value::Map(vec![(Value::from(1), Value::from(0))]))
             .map_err(|_| Refusal::new(Status::ServerError, "Could not build bundle"))?;
         Ok(Response::File { data, metadata: Some(metadata) })
     }
+
+    /// A copy of a bundle built lately, if it isn't over the size sent.
+    fn cached(&self, key: &CacheKey) -> Result<Option<Vec<u8>>, Refusal> {
+        let Some(data) = self.cache.lock().ok().and_then(|mut cache| cache.get(key)) else { return Ok(None) };
+        if data.len() > self.max_bundle_bytes {
+            return Err(Refusal::new(Status::ServerError, "Bundle is too large"));
+        }
+        Ok(Some(data.as_ref().clone()))
+    }
 }
 
 impl Node {
     fn push(&self, request: &Value, map: &MapRef, peer: &[u8; 16]) -> Result<Response, Refusal> {
-        let (_, repo) = self.writable(request, peer)?;
+        let (name, repo) = self.writable(request, peer)?;
+        let (group, dir) = split_repo_path(&name).ok_or(Refusal::new(Status::NotFound, "Not found"))?;
+        // One writer at a time, so a refused push can take away what it unpacked.
+        let _held = self
+            .writing
+            .hold(&self.root.join(group).join(dir), self.max_request_time)
+            .ok_or(Refusal::new(Status::ServerError, "Repository is busy, try again later"))?;
         let force = map.get("force").and_then(Value::as_bool).unwrap_or(false);
         if let Some(Value::Array(operations)) = map.get("operations") {
             return self.update_refs(&repo, operations);
@@ -463,10 +506,21 @@ impl Node {
         if dir_size(repo.git_dir()).saturating_add(data.len() as u64) > self.quotas.max_repo_bytes {
             return Err(Refusal::new(Status::ServerError, "Repository is full"));
         }
-        let unverified = || Refusal::new(Status::ServerError, "Could not verify bundle");
-        let tips = self.unpack_in_time(&repo, data).map_err(|_| unverified())?;
-        let (new, _) = tips.first().ok_or_else(unverified)?;
-        self.set_ref(&repo, &remote, *new, force).map_err(|_| unverified())?;
+        let packs = repo.objects.store_ref().path().join("pack");
+        let before = support::file_names(&packs);
+        let pushed = self.unpack_in_time(&repo, data).ok().and_then(|tips| {
+            let (new, _) = tips.first()?;
+            self.set_ref(&repo, &remote, *new, force).ok()
+        });
+        if pushed.is_none() {
+            // What a refused push unpacked goes, so refused pushes can't fill the
+            // disk. Nothing points at it: writers take turns.
+            drop(repo);
+            for added in support::file_names(&packs).difference(&before) {
+                let _ = std::fs::remove_file(packs.join(added));
+            }
+            return Err(Refusal::new(Status::ServerError, "Could not verify bundle"));
+        }
         Ok(ack())
     }
 
@@ -571,16 +625,24 @@ impl Node {
         if dir.exists() {
             return Err(Refusal::new(Status::NotAllowed, "Repository already exists"));
         }
+        support::nothing_left_behind(&group_dir, repo)?;
         let kept = std::fs::read_dir(&group_dir).map_or(0, |entries| entries.flatten().filter(|e| e.path().is_dir()).count());
         if kept >= self.quotas.max_repos_per_group {
             return Err(Refusal::new(Status::ServerError, "Too many repositories in this group"));
         }
         let failed = || Refusal::new(Status::ServerError, "Could not create repository");
-        gix::init_bare(&dir).map_err(|_| failed())?;
-        // The default branch, whatever this computer's git is set to.
-        std::fs::write(dir.join("HEAD"), "ref: refs/heads/master\n").map_err(|_| failed())?;
-        let allowed = group_dir.join(format!("{repo}.allowed"));
-        std::fs::write(allowed, format!("adm:{}", hex::encode(peer))).map_err(|_| failed())?;
+        support::claim(&dir)?;
+        let made = (|| {
+            gix::init_bare(&dir).map_err(drop)?;
+            // The default branch, whatever this computer's git is set to.
+            write_file(&dir.join("HEAD"), b"ref: refs/heads/master\n").map_err(drop)?;
+            support::write_new(&group_dir.join(format!("{repo}.allowed")), format!("adm:{}", hex::encode(peer)).as_bytes()).map_err(drop)
+        })();
+        if made.is_err() {
+            // The folder is this request's own: nothing else could make it.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(failed());
+        }
         Ok(ack())
     }
 
@@ -595,12 +657,14 @@ impl Node {
                     flag.store(true, Ordering::Relaxed);
                 }
             });
-            let built = bundle::build_many_until(repo, wants, others, flag);
+            // Stops as soon as the bundle passes the limit, so a big repository costs no more memory than that.
+            let built = bundle::build_capped(repo, wants, others, flag, self.max_bundle_bytes);
             let _ = stop.send(());
             built
         });
         match built {
             Ok(data) => Ok(data),
+            Err(crate::Error::TooLarge { .. }) => Err(Refusal::new(Status::ServerError, "Bundle is too large")),
             Err(_) if interrupt.load(Ordering::Relaxed) => Err(Refusal::new(Status::ServerError, "Took too long")),
             Err(_) => Err(Refusal::new(Status::ServerError, "Could not build bundle")),
         }
@@ -642,14 +706,13 @@ fn dir_size(path: &Path) -> u64 {
     total
 }
 
-/// `group/name.git` split in two, if both parts are plain folder names.
+/// `group/name.git` split in two, if both parts are plain folder names
+/// (and safe as folder names everywhere: not `nul` or `con.git`, which are
+/// devices on Windows, nor ending in a dot).
 pub fn split_repo_path(path: &str) -> Option<(&str, &str)> {
     let (group, repo) = path.split_once('/')?;
     let plain = |s: &str| {
-        !s.is_empty()
-            && s.len() <= 100
-            && !s.starts_with('.')
-            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+        s.len() <= 100 && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')) && support::plain_file_name(s)
     };
     (plain(group) && plain(repo) && repo.ends_with(".git") && repo.len() > 4).then_some((group, repo))
 }

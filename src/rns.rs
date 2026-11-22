@@ -51,7 +51,8 @@ impl RnsTransport {
 }
 
 /// The most a file reply is read back into memory: what a Resource may hold.
-const MAX_FILE_REPLY: u64 = 134_217_727;
+/// [`crate::client::Limits`] defaults to the same, so its caps can be reached.
+const MAX_FILE_REPLY: u64 = crate::client::MAX_RESOURCE_BYTES as u64;
 
 /// Sort a link response into a plain reply or a bulk file. rsReticulum hands a
 /// plain reply back already unwrapped (status byte then payload); only a
@@ -91,6 +92,7 @@ fn read_capped(path: &std::path::Path, max: u64) -> std::io::Result<Vec<u8>> {
 impl Transport for RnsTransport {
     async fn request(&self, path: &str, data: Vec<u8>) -> Result<Response, Error> {
         let mut guard = self.session.lock().await;
+        let repeatable = safe_to_repeat(path, &request_value(&data));
         for attempt in 0..2 {
             if guard.is_none() {
                 *guard = Some(self.connect().await?);
@@ -99,14 +101,40 @@ impl Transport for RnsTransport {
             let options = RequestOptions { timeout: Some(self.request_timeout), ..RequestOptions::default() };
             match session.handle.request_with_options(path, request_value(&data), options).await {
                 Ok(response) => return classify(response).await,
-                // A dead link is worth one fresh try; anything else is final.
-                Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive) if attempt == 0 => {
+                // A dead link is worth one fresh try, but only for a request
+                // that does no harm if the node got it the first time: the
+                // link can drop after the request went out, and a second
+                // comment, document or release must not be made.
+                Err(LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive) if attempt == 0 && repeatable => {
                     *guard = None;
+                }
+                Err(e @ (LinkSessionError::SessionClosed | LinkSessionError::LinkNotActive)) => {
+                    *guard = None;
+                    return Err(Error::Transport(format!("{e}; the node may or may not have got the request")));
                 }
                 Err(e) => return Err(Error::Transport(e.to_string())),
             }
         }
         Err(Error::Transport("link kept dropping".into()))
+    }
+}
+
+/// Whether a request only reads, so sending it twice changes nothing on the
+/// node: ref lists, fetches, and the list, view, fetch and permission reads.
+fn safe_to_repeat(path: &str, request: &rmpv::Value) -> bool {
+    let map = crate::wire::MapRef::new(request).ok();
+    let field = |key: &str| map.as_ref().and_then(|m| m.str(key));
+    let (operation, step) = (field("operation"), field("step"));
+    match path {
+        "/git/list" | "/git/fetch" => true,
+        "/mgmt/release" => matches!(operation.as_deref(), Some("list" | "view" | "fetch")),
+        "/mgmt/work" => match operation.as_deref() {
+            Some("list" | "view") => true,
+            Some("perms") => step.as_deref() == Some("get"),
+            _ => false,
+        },
+        "/mgmt/perms" => step.as_deref() == Some("get"),
+        _ => false,
     }
 }
 
@@ -190,6 +218,44 @@ mod tests {
         assert_eq!(map.len(), 2);
         // Bytes that aren't MessagePack stay bytes.
         assert_eq!(request_value(&[0x92, 0x01]), rmpv::Value::Binary(vec![0x92, 0x01]));
+    }
+
+    #[test]
+    fn only_requests_that_read_are_sent_again_after_a_drop() {
+        use crate::wire::Request;
+        let value = |request: Request| request_value(&request.encode());
+        let repo = || Request::repo("public/demo.git");
+        for (path, request) in [
+            ("/git/list", repo().put("for_push", true)),
+            ("/git/fetch", repo()),
+            ("/mgmt/release", repo().put("operation", "list")),
+            ("/mgmt/release", repo().put("operation", "view")),
+            ("/mgmt/release", repo().put("operation", "fetch")),
+            ("/mgmt/work", repo().put("operation", "view")),
+            ("/mgmt/work", repo().put("operation", "perms").put("step", "get")),
+            ("/mgmt/perms", repo().put("operation", "rperms").put("step", "get")),
+        ] {
+            assert!(safe_to_repeat(path, &value(request)), "{path}");
+        }
+        for (path, request) in [
+            ("/git/push", repo()),
+            ("/git/delete", repo()),
+            ("/git/create", repo()),
+            ("/git/fork", repo()),
+            ("/git/sync", repo()),
+            ("/mgmt/release", repo().put("operation", "create").put("step", "artifact")),
+            ("/mgmt/release", repo().put("operation", "delete")),
+            ("/mgmt/release", repo().put("operation", "latest")),
+            ("/mgmt/release", repo()),
+            ("/mgmt/work", repo().put("operation", "comment")),
+            ("/mgmt/work", repo().put("operation", "create")),
+            ("/mgmt/work", repo().put("operation", "perms").put("step", "set")),
+            ("/mgmt/perms", repo().put("operation", "rperms").put("step", "set")),
+            ("/unknown", repo()),
+        ] {
+            assert!(!safe_to_repeat(path, &value(request)), "{path}");
+        }
+        assert!(!safe_to_repeat("/mgmt/work", &rmpv::Value::Binary(vec![1])));
     }
 
     #[test]

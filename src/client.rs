@@ -12,6 +12,12 @@ use crate::transport::{Response, Transport};
 use crate::url::RepoUrl;
 use crate::wire::{self, MapRef, Request};
 
+/// The most one reply over Reticulum can carry: rsReticulum's largest
+/// Resource (`MAX_RESOURCE_SIZE`, 128 MiB less a byte). `rns::RnsTransport`
+/// reads no more than this back, so [`Limits`] defaults to it for bundles and
+/// artifacts: a higher limit could never be reached over Reticulum.
+pub const MAX_RESOURCE_BYTES: usize = 134_217_727;
+
 /// Caps on everything that comes back from a node.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -33,8 +39,8 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            max_bundle_bytes: 512 * 1024 * 1024,
-            max_artifact_bytes: 512 * 1024 * 1024,
+            max_bundle_bytes: MAX_RESOURCE_BYTES,
+            max_artifact_bytes: MAX_RESOURCE_BYTES,
             max_reply_bytes: 16 * 1024 * 1024,
             max_refs: 100_000,
             max_list_entries: 10_000,
@@ -163,10 +169,11 @@ pub struct WorkDoc {
     pub edited: f64,
     pub author: String,
     pub format: String,
-    /// The author's 64-byte public key.
+    /// The author's 64-byte public key, as the node sent it.
     pub identity: Option<[u8; 64]>,
     pub signature: Option<[u8; 64]>,
-    /// True when the content's signature checked out against `identity`.
+    /// True when the content's signature checked out against `identity`, and
+    /// `identity` is the key of `author`.
     pub verified: bool,
 }
 
@@ -183,14 +190,37 @@ fn check_ref_name(name: &str) -> Result<()> {
     if bundle::valid_ref_name(name) { Ok(()) } else { Err(Error::InvalidInput(format!("{name:?} is not a full ref name"))) }
 }
 
-/// Reject names that could escape a directory or confuse a path.
+/// Whether `name` is one Windows keeps for a device, such as `CON` or
+/// `com1.txt`. Windows opens the device for these whatever the extension,
+/// and ignores spaces before the extension.
+fn windows_device_name(name: &str) -> bool {
+    let stem = name.split('.').next().unwrap_or_default().trim_end_matches(' ').to_ascii_uppercase();
+    match stem.as_str() {
+        "CON" | "PRN" | "AUX" | "NUL" => true,
+        _ => match (stem.get(..3), stem.get(3..)) {
+            (Some("COM" | "LPT"), Some(n)) => matches!(n, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"),
+            _ => false,
+        },
+    }
+}
+
+/// Reject names that could escape a directory or confuse a path, on any
+/// system: a release file is saved under its name, and embedders use this
+/// as their guard. `C:x` escapes a folder on Windows, `CON` opens a device,
+/// and Windows drops a trailing dot or space.
 pub fn check_artifact_name(name: &str) -> Result<()> {
     let bad = name.is_empty()
         || name.len() > 255
         || name == "."
         || name == ".."
-        || name.contains(['/', '\\', '\0'])
-        || name.chars().any(char::is_control);
+        || name.contains(['/', '\\', '\0', ':', '<', '>', '"', '|', '?', '*'])
+        || name.chars().any(char::is_control)
+        || name.ends_with(['.', ' '])
+        || windows_device_name(name)
+        || !matches!(
+            Path::new(name).components().collect::<Vec<_>>().as_slice(),
+            [std::path::Component::Normal(part)] if *part == std::ffi::OsStr::new(name)
+        );
     if bad { Err(Error::InvalidInput(format!("unsafe artifact name {name:?}"))) } else { Ok(()) }
 }
 
@@ -296,11 +326,14 @@ impl<T: Transport> Client<T> {
 
     /// Fetch the wanted refs into the repository at `dest` (made bare if it
     /// doesn't exist). Only what `dest` lacks is downloaded. Returns the refs
-    /// that were set.
+    /// that were set: only the wanted ones, and only where the bundle has
+    /// them at the object each [`Want`] names. Any other ref the node puts in
+    /// the bundle is left out.
     pub async fn fetch_into(&self, repo: &RepoUrl, wants: &[Want], dest: &Path) -> Result<Vec<(ObjectId, String)>> {
         let data = self.fetch_bundle_with(repo, wants, &Self::haves_in(wants, dest)).await?;
         let repository = bundle::open_or_init_bare(dest)?;
-        bundle::ingest_checked(&repository, &data, self.limits.pack)
+        let wanted: Vec<(&str, Option<ObjectId>)> = wants.iter().map(|w| (w.name.as_str(), Some(w.sha))).collect();
+        bundle::ingest_wanted(&repository, &data, self.limits.pack, &wanted)
     }
 
     /// Like [`Client::fetch_into`] but only adds objects: no ref is written.
@@ -312,7 +345,26 @@ impl<T: Transport> Client<T> {
     }
 
     /// Fetch every branch and tag the node lists, plus HEAD, into `dest`.
+    ///
+    /// When `dest` isn't a repository yet, the clone is made in a new folder
+    /// beside it and moved into place once it is complete, so a failure
+    /// leaves nothing behind and the clone can simply be tried again. `dest`
+    /// may then be missing or an empty folder. A repository already at
+    /// `dest` is brought up to date where it is.
     pub async fn clone_into(&self, repo: &RepoUrl, dest: &Path) -> Result<RemoteRefs> {
+        if gix::open(dest).is_ok() {
+            return self.clone_in_place(repo, dest).await;
+        }
+        if dest.exists() && dest.read_dir().map_err(Error::git)?.next().is_some() {
+            return Err(Error::InvalidInput(format!("{} is not empty and not a repository", dest.display())));
+        }
+        let partial = Partial::beside(dest)?;
+        let remote = self.clone_in_place(repo, &partial.0).await?;
+        partial.finish(dest)?;
+        Ok(remote)
+    }
+
+    async fn clone_in_place(&self, repo: &RepoUrl, dest: &Path) -> Result<RemoteRefs> {
         let remote = self.list(repo, false).await?;
         let wants: Vec<Want> = remote
             .refs
@@ -354,7 +406,10 @@ impl<T: Transport> Client<T> {
             let repository = gix::open(source).map_err(Error::git)?;
             let platform = repository.references().map_err(Error::git)?;
             for prefix in ["refs/heads/", "refs/tags/"] {
-                for reference in platform.prefixed(prefix).map_err(Error::git)?.flatten() {
+                // A ref that can't be read stops the push: taken as missing,
+                // prune would delete it on the node.
+                for reference in platform.prefixed(prefix).map_err(Error::git)? {
+                    let reference = reference.map_err(Error::git)?;
                     let name = reference.name().as_bstr().to_string();
                     // A name the node would refuse is skipped here rather than failing the whole push.
                     if check_ref_name(&name).is_ok() {
@@ -455,13 +510,18 @@ impl<T: Transport> Client<T> {
         let have = remote.get(remote_ref);
         let (direct, data) = {
             let repository = gix::open(source).map_err(Error::git)?;
+            let direct = bundle::direct_id(&repository, local_ref)?;
+            // Already there. An annotated tag is listed as its tag object,
+            // which isn't an ancestor of the commit it names.
+            if have == Some(direct) {
+                return Ok(());
+            }
             if let (Some(old), false) = (have, force) {
                 let tip = bundle::resolve_ref(&repository, local_ref)?;
                 if !bundle::is_ancestor(&repository, old, tip)? {
                     return Err(Error::NonFastForward);
                 }
             }
-            let direct = bundle::direct_id(&repository, local_ref)?;
             let tips: Vec<ObjectId> = remote.refs.iter().map(|(sha, _)| *sha).collect();
             let held = bundle::held_by_remote(&repository, direct, &tips);
             (direct, if held { None } else { Some(bundle::build(&repository, local_ref, have)?) })
@@ -582,10 +642,46 @@ impl<T: Transport> Client<T> {
     }
 
     /// Download a release's manifest and every artifact it lists, and verify
-    /// all signatures. The caller decides whether to trust the signer.
+    /// all signatures. The manifest must be for `repo` on this node and, unless
+    /// `tag` is `"latest"`, for `tag`, so a node can't hand out another
+    /// repository's release or an older one.
+    ///
+    /// A valid signature only proves that whoever holds the key in the
+    /// manifest made it; anyone can make a key. Who signed it is
+    /// `manifest.signer.signer`: compare it with an identity you trust, or use
+    /// [`Client::fetch_release_signed_by`].
     pub async fn fetch_verified_release(&self, repo: &RepoUrl, tag: &str) -> Result<(Manifest, Vec<(String, Vec<u8>)>)> {
+        self.fetch_release_checked(repo, tag, None).await
+    }
+
+    /// [`Client::fetch_verified_release`], refusing the release with
+    /// [`Error::Verify`] unless the identity `signer` (a 16-byte identity
+    /// hash) signed it. Nothing past the manifest is downloaded otherwise.
+    pub async fn fetch_release_signed_by(
+        &self,
+        repo: &RepoUrl,
+        tag: &str,
+        signer: &[u8; 16],
+    ) -> Result<(Manifest, Vec<(String, Vec<u8>)>)> {
+        self.fetch_release_checked(repo, tag, Some(signer)).await
+    }
+
+    async fn fetch_release_checked(
+        &self,
+        repo: &RepoUrl,
+        tag: &str,
+        signer: Option<&[u8; 16]>,
+    ) -> Result<(Manifest, Vec<(String, Vec<u8>)>)> {
         let rsm = self.fetch_artifact(repo, tag, "manifest.rsm").await?;
         let manifest = sign::verify_manifest(&rsm)?;
+        check_manifest_for(&manifest, repo, tag, signer)?;
+        let mut names = std::collections::HashSet::new();
+        for artifact in &manifest.artifacts {
+            check_artifact_name(&artifact.name).map_err(|_| Error::Verify(format!("manifest lists an unsafe name {:?}", artifact.name)))?;
+            if !names.insert(artifact.name.as_str()) {
+                return Err(Error::Verify(format!("manifest lists {} twice", artifact.name)));
+            }
+        }
         let mut files = Vec::new();
         for artifact in &manifest.artifacts {
             files.push((artifact.name.clone(), self.fetch_artifact(repo, tag, &artifact.name).await?));
@@ -620,10 +716,14 @@ impl<T: Transport> Client<T> {
         released: &str,
         now: u64,
     ) -> Result<()> {
+        let mut names = std::collections::HashSet::new();
         for (name, _) in files {
             check_artifact_name(name)?;
             if name == "manifest.rsm" || name.ends_with(".rsg") {
                 return Err(Error::InvalidInput(format!("{name} is reserved for signatures")));
+            }
+            if !names.insert(name.as_str()) {
+                return Err(Error::InvalidInput(format!("{name} is given twice")));
             }
         }
         let step = |s: &str| Self::release_request(repo, "create").put("step", s).put("tag", tag);
@@ -730,8 +830,16 @@ impl<T: Transport> Client<T> {
         let content = m.str("content").unwrap_or_default();
         let identity: Option<[u8; 64]> = meta.bytes("identity").and_then(|b| b.try_into().ok());
         let signature: Option<[u8; 64]> = meta.bytes("signature").and_then(|b| b.try_into().ok());
-        let verified = match (identity, signature) {
-            (Some(key), Some(sig)) => sign::verify_signature(&key, content.as_bytes(), &sig).is_ok(),
+        // The node sends the key; it only counts if it is the author's.
+        let author: Option<[u8; 16]> = match meta.get("author") {
+            Some(Value::Binary(raw)) => raw.as_slice().try_into().ok(),
+            Some(Value::String(text)) => text.as_str().and_then(|t| hex::decode(t).ok()).and_then(|raw| raw.try_into().ok()),
+            _ => None,
+        };
+        let verified = match (identity, signature, author) {
+            (Some(key), Some(sig), Some(author)) => {
+                sign::identity_hash(&key) == author && sign::verify_signature(&key, content.as_bytes(), &sig).is_ok()
+            }
             _ => false,
         };
         Ok(WorkDoc {
@@ -809,6 +917,72 @@ impl<T: Transport> Client<T> {
     pub async fn set_work_perms(&self, repo: &RepoUrl, doc_id: u64, content: &str) -> Result<()> {
         let request = Self::work_request(repo, "perms").put("doc_id", doc_id).put("step", "set").put("content", content);
         self.packet("/mgmt/work", request).await.map(drop)
+    }
+}
+
+/// Refuse a verified manifest that isn't the release asked for: one for
+/// another repository or node, another tag (unless `tag` is `"latest"`), or,
+/// when `signer` is given, signed by anyone else. Fails with [`Error::Verify`].
+/// [`Client::fetch_verified_release`] does this; call it after
+/// [`sign::verify_manifest`] on a manifest fetched some other way.
+pub fn check_manifest_for(manifest: &Manifest, repo: &RepoUrl, tag: &str, signer: Option<&[u8; 16]>) -> Result<()> {
+    if tag != "latest" && manifest.version != tag {
+        return Err(Error::Verify(format!("the manifest is for {:?}, not {tag:?}", manifest.version)));
+    }
+    if manifest.path != repo.repo_path() {
+        return Err(Error::Verify(format!("the manifest is for {:?}, not {}", manifest.path, repo.repo_path())));
+    }
+    if manifest.origin != Some(repo.destination) {
+        return Err(Error::Verify("the manifest is for a repository on another node".into()));
+    }
+    if let Some(expected) = signer
+        && manifest.signer.signer != *expected
+    {
+        return Err(Error::Verify(format!(
+            "the release was signed by {}, not by {}",
+            hex::encode(manifest.signer.signer),
+            hex::encode(expected)
+        )));
+    }
+    Ok(())
+}
+
+/// A folder a clone is made in before it is moved to where it belongs.
+/// Removed when dropped unless it was moved, so an error or a cancelled
+/// clone leaves nothing.
+struct Partial(std::path::PathBuf);
+
+impl Partial {
+    /// A new, empty folder next to `dest`, in the same directory so the
+    /// move is a rename.
+    fn beside(dest: &Path) -> Result<Partial> {
+        static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let name = dest.file_name().ok_or_else(|| Error::InvalidInput(format!("{} is not a folder name", dest.display())))?;
+        let parent = dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        std::fs::create_dir_all(parent).map_err(Error::git)?;
+        let made = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!(".{}.partial-{}-{made}", name.to_string_lossy(), std::process::id()));
+        std::fs::create_dir(&path).map_err(Error::git)?;
+        Ok(Partial(path))
+    }
+
+    /// Move the finished clone to `dest`, which is missing or an empty folder.
+    fn finish(mut self, dest: &Path) -> Result<()> {
+        if dest.is_dir() {
+            // Only an empty one; Windows won't rename onto a folder at all.
+            std::fs::remove_dir(dest).map_err(Error::git)?;
+        }
+        std::fs::rename(&self.0, dest).map_err(Error::git)?;
+        self.0 = std::path::PathBuf::new();
+        Ok(())
+    }
+}
+
+impl Drop for Partial {
+    fn drop(&mut self) {
+        if !self.0.as_os_str().is_empty() {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
     }
 }
 

@@ -15,7 +15,7 @@
 
 use rmpv::Value;
 
-use super::support::{now, packed, refuse, text, write_file};
+use super::support::{MAX_REPLY_BYTES, first_chars, now, packed, plain_file_name, refuse, text, write_file};
 use super::{Node, Perm, Refusal, ack, dir_size, int_key, split_repo_path};
 use crate::error::Status;
 use crate::transport::Response;
@@ -27,23 +27,23 @@ const MAX_RELEASES: usize = 1000;
 const MAX_META_BYTES: u64 = 16 * 1024;
 /// Longest notes read back, or taken.
 const MAX_NOTES_BYTES: usize = 256 * 1024;
+/// Most characters of the notes a list shows of each release.
+const MAX_PREVIEW_CHARS: usize = 1000;
 
-/// A tag as a release folder's name: letters, digits and `._-+`, and not
-/// a name that means a folder up.
+/// A tag as a release folder's name: letters, digits and `._-+`, a name
+/// that is safe as a folder's, and not `latest`, the file beside the
+/// folders that names the latest release (in any case, as some systems
+/// don't tell them apart).
 fn plain_tag(tag: &str) -> bool {
-    !tag.is_empty()
-        && tag.len() <= 100
-        && !tag.starts_with('.')
+    tag.len() <= 100
         && tag.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | '+'))
+        && !tag.eq_ignore_ascii_case("latest")
+        && plain_file_name(tag)
 }
 
 /// An artifact's name as a file's: a single plain name, nothing hidden.
 fn plain_artifact(name: &str) -> bool {
-    !name.is_empty()
-        && name.len() <= 200
-        && !name.starts_with('.')
-        && !name.contains(['/', '\\', '\0'])
-        && !name.chars().any(char::is_control)
+    name.len() <= 200 && plain_file_name(name)
 }
 
 /// The `META` of a release, as lines of `key = value`.
@@ -149,15 +149,22 @@ impl Node {
             let (notes, format) = read_notes(&path).unwrap_or_default();
             // What stock shows: the notes without their headings and quotes.
             let preview: Vec<&str> = notes.lines().filter(|l| !l.starts_with('#') && !l.starts_with('>')).collect();
+            let preview = first_chars(preview.join("\n").trim(), MAX_PREVIEW_CHARS).trim_end().to_string();
             let created = meta_get(&meta, "created").and_then(|c| c.parse::<u64>().ok()).unwrap_or(0);
-            found.push((created, tag, meta, preview.join("\n").trim().to_string(), format, artifacts(&path).len()));
+            found.push((created, tag, meta, preview, format, artifacts(&path).len()));
         }
         found.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
         found.truncate(MAX_RELEASES);
         let published = |tag: &str| found.iter().any(|f| f.1 == tag && meta_get(&f.2, "status") == Some("published"));
         let latest = std::fs::read_to_string(releases.join("latest")).ok().map(|t| t.trim().to_string()).filter(|t| published(t));
+        // The newest first, while they fit in one reply.
+        let mut size = 0usize;
         let list: Vec<Value> = found
             .iter()
+            .take_while(|(_, tag, meta, preview, ..)| {
+                size += 128 + tag.len() + preview.len() + meta.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+                size <= MAX_REPLY_BYTES
+            })
             .map(|(created, tag, meta, preview, format, count)| {
                 Value::Map(vec![
                     (text("tag"), text(tag)),
@@ -234,7 +241,13 @@ impl Node {
         map: &MapRef,
         peer: &[u8; 16],
     ) -> Result<Response, Refusal> {
-        let tag = map.str("tag").filter(|t| plain_tag(t)).ok_or(refuse(Status::BadRequest, "Invalid tag name"))?;
+        let tag = map.str("tag").ok_or(refuse(Status::BadRequest, "Invalid tag name"))?;
+        if tag.eq_ignore_ascii_case("latest") {
+            return Err(refuse(Status::BadRequest, "A release can't be called latest: that name means the latest release"));
+        }
+        if !plain_tag(&tag) {
+            return Err(refuse(Status::BadRequest, "Invalid tag name"));
+        }
         let repo = gix::open(repo_dir).map_err(|_| refuse(Status::ServerError, "Repository is unreadable"))?;
         if repo.find_reference(format!("refs/tags/{tag}").as_str()).is_err() {
             return Err(refuse(Status::BadRequest, &format!("Tag '{tag}' does not exist in repository")));

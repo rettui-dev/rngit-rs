@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 
-use super::support::{check_rules, write_file};
+use super::support::{beside, check_rules, claim, nothing_left_behind, write_file, write_new};
 use super::upstream::{checked_source, read_following};
 use super::{Following, Follows, MAX_RULES_BYTES, NULL_IDENT, Node, Perm, dir_size, split_repo_path};
 
@@ -40,11 +40,6 @@ fn checked(group: &str, repo: &str) -> Result<(), String> {
     plain_repo(group, repo)
         .then_some(())
         .ok_or_else(|| format!("\"{group}/{repo}\" isn't a group and a name.git made of letters, digits and -_."))
-}
-
-/// What sits beside a repository and goes where it goes: its rules, releases and work documents.
-fn beside(group_dir: &Path, repo: &str) -> [PathBuf; 3] {
-    ["allowed", "releases", "work"].map(|what| group_dir.join(format!("{repo}.{what}")))
 }
 
 fn read_text(path: &Path) -> String {
@@ -147,11 +142,21 @@ impl Node {
         let group_dir = self.room_for(group, repo)?;
         let dir = group_dir.join(repo);
         let failed = |e: String| format!("Couldn't make {group}/{repo}: {e}");
-        gix::init_bare(&dir).map_err(|e| failed(e.to_string()))?;
-        std::fs::write(dir.join("HEAD"), "ref: refs/heads/master\n").map_err(|e| failed(e.to_string()))?;
-        if let Some(admin) = admin {
-            write_file(&group_dir.join(format!("{repo}.allowed")), format!("adm:{}", hex::encode(admin)).as_bytes())
-                .map_err(|e| failed(e.to_string()))?;
+        nothing_left_behind(&group_dir, repo).map_err(|r| r.1)?;
+        claim(&dir).map_err(|r| failed(r.1))?;
+        let made = (|| {
+            gix::init_bare(&dir).map_err(|e| e.to_string())?;
+            write_file(&dir.join("HEAD"), b"ref: refs/heads/master\n").map_err(|e| e.to_string())?;
+            match admin {
+                Some(admin) => write_new(&group_dir.join(format!("{repo}.allowed")), format!("adm:{}", hex::encode(admin)).as_bytes())
+                    .map_err(|e| e.to_string()),
+                None => Ok(()),
+            }
+        })();
+        if let Err(e) = made {
+            // The folder is this call's own: nothing else could make it.
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(failed(e));
         }
         Ok(())
     }

@@ -23,8 +23,8 @@ Requires Rust 1.89 or newer (edition 2024).
 | Reading a copy | `local::log`, `local::log_page`, `local::commit`, `local::tree`, `local::file`, `local::kind`, `local::read` (`rngit log`, `commit`, `tree`, `show` DIR REF): history a page at a time, one commit with the files it changed, the files of a branch, tag or commit, one file's text or bytes, from a repository on this computer such as the one `mirror_into` keeps or one a node hosts |
 | Repositories | `create`, `fork`, `mirror`, `sync` |
 | Permissions | `repo_perms`, `group_perms`, `work_perms` and their `set_` calls |
-| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `create_release`, `delete_release`, `set_latest_release` (`release-latest`) |
-| Checking a release offline | `rngit release-get URL TAG manifest.rsm DIR` saves the signed manifest; `rngit verify MANIFEST [DIR]` checks its signature and each file of it found in DIR, with no node |
+| Releases | `releases`, `release`, `fetch_artifact`, `fetch_verified_release`, `fetch_release_signed_by` (`release-get ... --signer HASH`), `client::check_manifest_for`, `create_release`, `delete_release`, `set_latest_release` (`release-latest`) |
+| Checking a release offline | `rngit release-get URL TAG manifest.rsm DIR [--signer HASH]` saves the signed manifest and prints who signed it; `rngit verify MANIFEST [DIR]` checks its signature and each file of it found in DIR, with no node |
 | Hosting | `server::Node` answers `/git/list`, `/git/fetch`, `/git/push`, `/git/create`, `/git/delete`, `/git/fork`, `/git/mirror`, `/git/sync`, `/mgmt/release`, `/mgmt/perms` and `/mgmt/work` from a folder of `group/name.git` repositories, with the permissions of `.allowed` files; `serve::serve` puts it on Reticulum as a `git.repositories` node, and `rngit serve DIR [RULES]` runs one. Pushes, `create` and branch or tag deletion work, with size and time limits; releases and work documents can be read and written, permissions edited, and forks and mirrors made from `rns://` sources (`serve::upstream` does the fetching) and `https://` ones (gix, in-process, the `https` feature) and followed. Its owner manages it directly, with no request and whatever the rules say: `hosted` lists every repository with what it follows, its size and whether anyone may clone it, `readable_by` the ones one peer may read, `make_repository`, `follow_source` (fork or mirror), `sync_repository`, `rename_repository` and `delete_repository` (with its rules, releases and work documents), and `rules` and `set_rules` for a repository or a group. Stock `git clone` and ours both clone from it |
 | Work documents | `work_list`, `work_create` (create or propose), `work_view`, `work_comment`, `work_edit`, `work_complete`, `work_activate`, `work_delete` |
 | Finding nodes | `discovery::discover` listens for rngit announces |
@@ -88,12 +88,27 @@ identity git uses. The command logic is `rngit::cli`, so it is tested without a 
 ## Safety
 
 Everything a node sends is untrusted. Replies, bundles, artifacts and lists are size-capped
-(`Limits`), parsing never panics, ref names from bundles must be valid names under `refs/`, a
-bundle's pack is refused before it is unpacked if it holds too many objects or would unpack too
-big (`Limits::pack`, read from the sizes the pack declares), a bundle must carry the objects it builds on, artifact names with path separators are refused, and
-a pushed ref is checked for fast-forward locally because the node's refusal can't be told apart
-from a corrupt bundle. Release files are verified offline: signature, signer-equals-hash-of-key,
-artifact hash and the manifest's notes hash. **Trusting the signer is the caller's decision.**
+(`Limits`; bundles and artifacts default to 128 MiB less a byte, the most one Reticulum reply can
+carry), parsing never panics, ref names from bundles must be valid names under `refs/`, a fetch
+sets only the refs that were asked for, at the objects the node listed (`bundle::ingest_wanted`),
+a bundle's pack is refused before it is unpacked if it holds too many objects or would unpack too
+big (`Limits::pack`, read from the sizes the pack declares), a bundle must carry the objects it
+builds on, and a clone is made beside its folder and moved into place, so a failed one leaves
+nothing. Artifact names that are not one plain file name on every system (path separators, `:`
+and the other characters Windows refuses, a trailing dot or space, `CON`, `NUL`, `COM1` and the
+other device names) are refused, and saved files are written to a temporary name and renamed. A
+pushed ref is checked for fast-forward locally because the node's refusal can't be told apart
+from a corrupt bundle. A node's error text is printed with control characters escaped. After a
+dropped link only requests that read are sent again, so nothing is made twice.
+
+Release files are verified offline: signature, signer-equals-hash-of-key, artifact hash and the
+manifest's notes hash, and the manifest must be for the tag (unless `latest`), repository and
+node asked for. A work document counts as verified only if its key is its author's.
+
+**A valid signature alone is not trust.** Anyone can make an identity and sign a release with
+it, so a signature only says the files are as that identity made them. Check who signed it:
+`manifest.signer.signer` is the signer's identity hash, `fetch_release_signed_by` refuses any
+other signer, and `rngit release-get` prints the signer and takes `--signer HASH`.
 
 ## Status
 
